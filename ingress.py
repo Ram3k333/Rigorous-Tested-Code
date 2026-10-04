@@ -20,6 +20,10 @@ ABHIJIT
  SHOW_ABHIJIT reports when a body enters/leaves Abhijit (276°40' .. 280°53'20",
  i.e. Makara 6°40' .. 10°53'20", sidereal). It has its own level list because its
  end edge is not on the 108-pada grid. Use with SIDEREAL = True.
+
+ABHIJIT PADA
+ SHOW_ABHIJIT_PADA reports when a body enters Abhijit pada 1..4. Abhijit is split
+ into 4 equal padas of 1°03'20" each (5 edges: start, 3 inner, end).
 """
 import math
 import time
@@ -34,9 +38,9 @@ from concurrent.futures import ProcessPoolExecutor
 #                              CONFIG
 # =====================================================================
 # ---- time range (Julian Day, UT; no datetime used) --------------------
-START_DATE = (2000, 1, 1, 0.0)     # (year, month, day, hour) -> converted with swe.julday
+START_DATE = (2026, 1, 1, 0.0)     # (year, month, day, hour) -> converted with swe.julday
 START_JD   = None                  # set a JD here to override START_DATE
-DAYS       = 30                  # length of range
+DAYS       = 5000                   # length of range
 PAD        = 3.0                   # compute this many days outside the range (edge safety)
 START_DATE_IS_LOCAL = True         # True -> START_DATE is IST (TZ_OFFSET_HOURS), not UT
 
@@ -65,27 +69,27 @@ NO_GRAV_DEFLECTION = False          # True -> skip Sun light deflection (needed:
 BODY_ON = {
     "Sun": False, "Moon": True, "Mercury": False, "Venus": False, "Mars": False,
     "Jupiter": False, "Saturn": False, "Uranus": False, "Neptune": False, "Pluto": False,
-    "Rahu": True, "Ketu": False,    # both False -> node never fitted (saves calls)
+    "Rahu": False, "Ketu": False,    # both False -> node never fitted (saves calls)
 }
 
 # ---- which events ------------------------------------------------------
 SHOW_RASHI           = True
-SHOW_NAKSHATRA       = False        # (tropical mode: still computed, but not meaningful)
-SHOW_PADA            = False
+SHOW_NAKSHATRA       = True        # (tropical mode: still computed, but not meaningful)
+SHOW_PADA            = True
 SHOW_ABHIJIT         = False        # Abhijit entry/exit (use with SIDEREAL = True)
+SHOW_ABHIJIT_PADA    = False         # when entering Abhijit pada 1..4 (use with SIDEREAL = True)
 ABHIJIT_START_DEG    = 276 + 40/60             # 6°40' Makara (start of U.Ashadha pada 4)
 ABHIJIT_END_DEG      = 280 + 53/60 + 20/3600   # 10°53'20" Makara
-SHOW_VAKRI           = False        # retrograde stations
-SHOW_MARGI           = False        # direct stations
+SHOW_VAKRI           = True        # retrograde stations
+SHOW_MARGI           = True        # direct stations
 SHOW_RETRO_REENTRY   = True        # False -> hide backward (retrograde) boundary crossings
 
 # ---- output ------------------------------------------------------------
-SAVE_CSV             = False
 PRINT_TABLE          = True
 PRINT_TIME           = True
 PRINT_CALLS          = True
 PRINT_LEGEND         = True
-SHOW_MOTION_COLUMN   = False        # the D/R/S column
+SHOW_MOTION_COLUMN   = True        # the D/R/S column
 SHOW_STATION_LONGITUDE = False     # "28.341 deg in Kumbha" on Vakri/Margi rows
 NUMBER_LABELS        = False       # "Makara (10)", "Shravana (22)"
 RASHI_LANGUAGE       = "english"   # "auto" (sanskrit if sidereal else english) / "sanskrit" / "english"
@@ -130,9 +134,11 @@ _win = {"Sun": 10.0, "Moon": 4.0, "Mercury": 8.0, "Venus": 12.0, "Mars": 24.0,
 _win.update(WINDOW_OVERRIDE)
 
 NEED_STATIONS  = SHOW_VAKRI or SHOW_MARGI
-NEED_CROSSINGS = SHOW_RASHI or SHOW_NAKSHATRA or SHOW_PADA or SHOW_ABHIJIT
+NEED_CROSSINGS = SHOW_RASHI or SHOW_NAKSHATRA or SHOW_PADA or SHOW_ABHIJIT or SHOW_ABHIJIT_PADA
 AB_START, AB_END = ABHIJIT_START_DEG % 360.0, ABHIJIT_END_DEG % 360.0
 AB_LEVELS = [AB_START, AB_END]     # index 0 = start edge, 1 = end edge
+AP_W = (AB_END - AB_START) / 4.0   # 1°03'20" per Abhijit pada
+AP_LEVELS = [AB_START + k * AP_W for k in range(5)]   # edges of pada 1|2|3|4; index 0 = start, 4 = end
 if SHOW_PADA or (SHOW_RASHI and SHOW_NAKSHATRA):
     GRID = 108
 elif SHOW_NAKSHATRA:
@@ -457,6 +463,8 @@ def job(args):
                         add(who, crossings(cw, wa, wb, GRID, lf))
                     if SHOW_ABHIJIT:
                         add(who + ":ab", crossings(cw, wa, wb, None, lf, AB_LEVELS))
+                    if SHOW_ABHIJIT_PADA:
+                        add(who + ":ap", crossings(cw, wa, wb, None, lf, AP_LEVELS))
                 add(who + ":st", [(j, k, (l + shift) % 360.0) for j, k, l in st])
     return ev, CALLS, WARN
 
@@ -491,7 +499,7 @@ def build(start, end):
     for k in db:
         if k.endswith(":st"):
             db[k] = _dedupe(db[k], key=lambda r: r[1], tpos=0)
-        else:                                                # grid crossings and :ab share layout
+        else:                                                # grid crossings, :ab and :ap share layout
             db[k] = _dedupe(db[k], key=lambda r: (r[0], r[2]), tpos=1)
     return db, calls, warns
 
@@ -616,6 +624,17 @@ def body_rows(db, name, lo, hi):
         mv = "RETROGRADE" if d < 0 else "DIRECT"
         enter = (i == 0) == (d > 0)
         rows.append((jd, name, "Abhijit", "Enters Abhijit" if enter else "Leaves Abhijit", mv))
+    for i, jd, d in db.get(name + ":ap", []):
+        if not lo <= jd < hi or (d < 0 and not SHOW_RETRO_REENTRY):
+            continue
+        if d > 0 and i < 4:            # moving forward over edge i -> enters pada i+1
+            p = i + 1
+        elif d < 0 and i > 0:          # moving backward over edge i -> enters pada i
+            p = i
+        else:                          # edge 0 backward / edge 4 forward = leaving Abhijit
+            continue
+        mv = "RETROGRADE" if d < 0 else "DIRECT"
+        rows.append((jd, name, "AbhPada", f"Abhijit-{p}", mv))
     for jd, kind, l in db.get(name + ":st", []):
         if not lo <= jd < hi or (kind == "Vakri" and not SHOW_VAKRI) \
                 or (kind == "Margi" and not SHOW_MARGI):
@@ -687,7 +706,6 @@ if __name__ == "__main__":
 
     if PRINT_TABLE:
         show(db, lo, hi)
-    if SAVE_CSV:
         save_csv(db, lo, hi, "planet_rigorous.csv")
     if PRINT_TIME:
         print(f"Execution time : {elapsed:.3f} s (excl. audit)")
