@@ -38,9 +38,9 @@ from concurrent.futures import ProcessPoolExecutor
 #                              CONFIG
 # =====================================================================
 # ---- time range (Julian Day, UT; no datetime used) --------------------
-START_DATE = (2026, 1, 1, 0.0)     # (year, month, day, hour) -> converted with swe.julday
+START_DATE = (2024, 3, 31, 0.0)     # (year, month, day, hour) -> converted with swe.julday
 START_JD   = None                  # set a JD here to override START_DATE
-DAYS       = 5000                   # length of range
+DAYS       = 3                   # length of range
 PAD        = 3.0                   # compute this many days outside the range (edge safety)
 START_DATE_IS_LOCAL = True         # True -> START_DATE is IST (TZ_OFFSET_HOURS), not UT
 
@@ -63,13 +63,13 @@ TOPOCENTRIC = False                # True -> observer-based (Moon parallax up to
 TOPO_LON, TOPO_LAT, TOPO_ALT = 75.8577, 22.7196, 553.0   # used only if TOPOCENTRIC
 TRUE_POSITION      = False         # True -> geometric (no light-time)
 NO_ABERRATION      = False         # True -> skip annual aberration
-NO_GRAV_DEFLECTION = False          # True -> skip Sun light deflection (needed: makes planet paths smooth near Sun conjunction)
+NO_GRAV_DEFLECTION = True          # True -> skip Sun light deflection (needed: makes planet paths smooth near Sun conjunction)
 
 # ---- which bodies ------------------------------------------------------
 BODY_ON = {
     "Sun": False, "Moon": True, "Mercury": False, "Venus": False, "Mars": False,
     "Jupiter": False, "Saturn": False, "Uranus": False, "Neptune": False, "Pluto": False,
-    "Rahu": False, "Ketu": False,    # both False -> node never fitted (saves calls)
+    "Rahu": False, "Ketu": False,
 }
 
 # ---- which events ------------------------------------------------------
@@ -102,7 +102,7 @@ AUDIT_STEP      = 5.0              # days between true-ephemeris audit samples (
 STRICT          = False             # True -> any warning is a hard error
 
 # ---- performance / accuracy -------------------------------------------
-WORKERS   = 1
+WORKERS   = 4
 CHUNK     = 180.0
 DEG       = 12
 TOL       = 1e-7                   # max tail coefficient (deg) before a window is split
@@ -706,7 +706,7 @@ if __name__ == "__main__":
 
     if PRINT_TABLE:
         show(db, lo, hi)
-        save_csv(db, lo, hi, "planet_rigorous.csv")
+        save_csv(db, lo, hi, "planet_rig.csv")
     if PRINT_TIME:
         print(f"Execution time : {elapsed:.3f} s (excl. audit)")
     if PRINT_CALLS:
