@@ -38,9 +38,9 @@ from concurrent.futures import ProcessPoolExecutor
 #                              CONFIG
 # =====================================================================
 # ---- time range (Julian Day, UT; no datetime used) --------------------
-START_DATE = (2024, 3, 31, 0.0)     # (year, month, day, hour) -> converted with swe.julday
+START_DATE = (1900, 1, 1, 0.0)     # (year, month, day, hour) -> converted with swe.julday
 START_JD   = None                  # set a JD here to override START_DATE
-DAYS       = 3                   # length of range
+DAYS       = 219146                   # length of range
 PAD        = 3.0                   # compute this many days outside the range (edge safety)
 START_DATE_IS_LOCAL = True         # True -> START_DATE is IST (TZ_OFFSET_HOURS), not UT
 
@@ -57,8 +57,10 @@ EQUINOX_J2000 = False              # tropical only: fixed J2000 ecliptic instead
 NODE_TYPE  = "mean"                # "mean" (smooth) or "true" (wobbling, has stations)
 
 # ---- ephemeris / position model ----------------------------------------
-EPHEMERIS  = "swieph"              # "swieph" (files, falls back to Moshier) or "moseph"
-EPHE_PATH  = None                  # folder with .se1 files, or None
+EPHEMERIS  = "swieph"              # "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in, ~1" less accurate)
+EPHE_PATH  = r"C:\Users\durva\PycharmProjects\Rigorous_Tested_Code"   # folder holding sepl_18.se1 + sepl_24.se1 (and the JPL file if EPHEMERIS="jpl")
+JPL_FILE   = "de440.eph"           # file name inside EPHE_PATH; de441 covers -13200..17191, de440 covers 1550..2650
+REQUIRE_EPHEMERIS = True           # True -> stop if swisseph silently falls back to a lower-quality ephemeris
 TOPOCENTRIC = False                # True -> observer-based (Moon parallax up to ~1 deg)
 TOPO_LON, TOPO_LAT, TOPO_ALT = 75.8577, 22.7196, 553.0   # used only if TOPOCENTRIC
 TRUE_POSITION      = False         # True -> geometric (no light-time)
@@ -67,17 +69,17 @@ NO_GRAV_DEFLECTION = True          # True -> skip Sun light deflection (needed: 
 
 # ---- which bodies ------------------------------------------------------
 BODY_ON = {
-    "Sun": False, "Moon": True, "Mercury": False, "Venus": False, "Mars": False,
-    "Jupiter": False, "Saturn": False, "Uranus": False, "Neptune": False, "Pluto": False,
-    "Rahu": False, "Ketu": False,
+    "Sun": True, "Moon": False, "Mercury": True, "Venus": True, "Mars": True,
+    "Jupiter": True, "Saturn": True, "Uranus": True, "Neptune": True, "Pluto": True,
+    "Rahu": True, "Ketu": True,
 }
 
 # ---- which events ------------------------------------------------------
 SHOW_RASHI           = True
 SHOW_NAKSHATRA       = True        # (tropical mode: still computed, but not meaningful)
 SHOW_PADA            = True
-SHOW_ABHIJIT         = False        # Abhijit entry/exit (use with SIDEREAL = True)
-SHOW_ABHIJIT_PADA    = False         # when entering Abhijit pada 1..4 (use with SIDEREAL = True)
+SHOW_ABHIJIT         = True        # Abhijit entry/exit (use with SIDEREAL = True)
+SHOW_ABHIJIT_PADA    = True         # when entering Abhijit pada 1..4 (use with SIDEREAL = True)
 ABHIJIT_START_DEG    = 276 + 40/60             # 6°40' Makara (start of U.Ashadha pada 4)
 ABHIJIT_END_DEG      = 280 + 53/60 + 20/3600   # 10°53'20" Makara
 SHOW_VAKRI           = True        # retrograde stations
@@ -162,7 +164,10 @@ FIT_BODIES = [nm for nm in ACTIVE if nm != "Ketu"]
 if "Ketu" in ACTIVE and "Rahu" not in FIT_BODIES:
     FIT_BODIES.append("Rahu")
 
-FLAGS = swe.FLG_MOSEPH if EPHEMERIS == "moseph" else swe.FLG_SWIEPH
+EPH_FLAG = {"swieph": swe.FLG_SWIEPH, "jpl": swe.FLG_JPLEPH, "moseph": swe.FLG_MOSEPH}[EPHEMERIS]
+EPH_NAME = {swe.FLG_SWIEPH: "Swiss Ephemeris files", swe.FLG_JPLEPH: "JPL " + JPL_FILE,
+            swe.FLG_MOSEPH: "Moshier (built-in)"}
+FLAGS = EPH_FLAG
 if SIDEREAL:
     FLAGS |= swe.FLG_SIDEREAL
 elif EQUINOX_J2000:
@@ -213,18 +218,40 @@ CALLS = 0
 WARN = []
 
 
+def _used_eph(ret):
+    """Which ephemeris swisseph actually used, from its return flag."""
+    for f in (swe.FLG_JPLEPH, swe.FLG_SWIEPH, swe.FLG_MOSEPH):
+        if ret & f:
+            return f
+    return swe.FLG_MOSEPH
+
+
+def _calc(jd, body, flags):
+    """swe.calc_ut + guard: swisseph silently falls back (JPL -> SE -> Moshier)
+    when a file is missing or out of range. ~1 arcsec difference can create or
+    remove a grazing crossing near a station, so stop instead of continuing."""
+    xx, ret = swe.calc_ut(jd, body, flags)
+    if REQUIRE_EPHEMERIS and not (ret & EPH_FLAG):
+        y, m, d, _ = swe.revjul(jd)
+        raise RuntimeError(
+            f"Ephemeris fallback at JD {jd:.5f} ({y:04d}-{m:02d}-{d:02d}): asked for "
+            f"{EPH_NAME[EPH_FLAG]}, got {EPH_NAME[_used_eph(ret)]}. "
+            f"Check EPHE_PATH={EPHE_PATH!r} contains the file covering this date.")
+    return xx
+
+
 def lon(jd, body):
     """Longitude only. Counted."""
     global CALLS
     CALLS += 1
-    return swe.calc_ut(jd, body, FLAGS)[0][0]
+    return _calc(jd, body, FLAGS)[0]
 
 
 def speed(jd, body):
     """True swisseph speed (deg/day), used only for station polishing. Counted."""
     global CALLS
     CALLS += 1
-    return swe.calc_ut(jd, body, FLAGS | swe.FLG_SPEED)[0][3]
+    return _calc(jd, body, FLAGS | swe.FLG_SPEED)[3]
 
 
 def wrap180(x):
@@ -234,6 +261,8 @@ def wrap180(x):
 def init_worker():
     if EPHE_PATH:
         swe.set_ephe_path(EPHE_PATH)
+    if EPHEMERIS == "jpl":
+        swe.set_jpl_file(JPL_FILE)
     if SIDEREAL:
         swe.set_sid_mode(getattr(swe, "SIDM_" + AYANAMSA))
     if TOPOCENTRIC:
@@ -685,6 +714,16 @@ if __name__ == "__main__":
         s_jd -= TZ_OFFSET_HOURS / 24.0
     lo, hi = s_jd, s_jd + DAYS
     init_worker()
+
+    # ---- ephemeris pre-flight: every active body, every ~10 years, both ends
+    probe = list(np.arange(lo - PAD, hi + PAD, 3652.5)) + [hi + PAD]
+    for nm in FIT_BODIES:
+        for t in probe:
+            lon(float(t), ID[nm])                  # raises if the file is missing/out of range
+    print(f"Ephemeris: {EPH_NAME[EPH_FLAG]}"
+          + (f"  (path: {EPHE_PATH})" if EPHE_PATH else "")
+          + ("  [fallback guard ON]" if REQUIRE_EPHEMERIS else "  [fallback guard OFF]"))
+
     t0 = time.perf_counter()
     db, calls, warns = build(lo - PAD, hi + PAD)
     elapsed = time.perf_counter() - t0
@@ -706,7 +745,7 @@ if __name__ == "__main__":
 
     if PRINT_TABLE:
         show(db, lo, hi)
-        save_csv(db, lo, hi, "planet_rig.csv")
+        save_csv(db, lo, hi, "planet_test.csv")
     if PRINT_TIME:
         print(f"Execution time : {elapsed:.3f} s (excl. audit)")
     if PRINT_CALLS:
