@@ -21,8 +21,18 @@ VERIFICATION
  3. Audit         - true pada read from swisseph every AUDIT_STEP days and the
                     event list replayed between samples.
  4. Event audit   - (optional) true pada just before / after every event.
+
+EPHEMERIS
+  "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in).
+  The Ascendant comes from sidereal time, obliquity and nutation, so the ephemeris
+  choice only enters through Delta-T (tidal acceleration of the chosen ephemeris) and
+  the ayanamsa; the effect on Lagna times is tiny. houses_ex() does not report which
+  ephemeris it used, so a PREFLIGHT probe (swe.calc_ut on the Sun at both ends of the
+  range) proves the requested ephemeris file is really loaded; with REQUIRE_EPHEMERIS
+  a silent fallback stops the run.
 """
 import math
+import os
 import time
 import bisect
 import csv
@@ -41,7 +51,7 @@ LAT_LIMIT  = 60.0                  # refuse |lat| above this (Ascendant stays fo
 # ---- time range (Julian Day, UT; no datetime used) --------------------
 START_DATE = (2026, 1, 1, 0.0)     # (year, month, day, hour) -> swe.julday
 START_JD   = None                  # set a JD here to override START_DATE
-DAYS       = 1.0                   # length of range
+DAYS       = 1                   # length of range
 PAD        = 0.05                  # days solved outside the range (seeding + edge safety)
 START_DATE_IS_LOCAL = True         # True -> START_DATE is local (TZ_OFFSET_HOURS), not UT
 
@@ -59,8 +69,10 @@ NO_NUTATION   = False              # True -> mean (not true) equinox
 HOUSE_SYSTEM  = b'A'               # only used to call houses_ex; ascmc[0] is system-free
 
 # ---- ephemeris ---------------------------------------------------------
-EPHEMERIS  = "swieph"              # "swieph" or "moseph"
-EPHE_PATH  = None                  # folder with .se1 files, or None
+EPHEMERIS  = "jpl"              # "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in, ~1" less accurate)
+EPHE_PATH  = r"C:\Users\durva\PycharmProjects\Rigorous_Tested_Code"   # folder holding the .se1 files (sepl_18 + semo_18 for 1800-2400, *_24 for 2400-3000) and the JPL file if EPHEMERIS="jpl"
+JPL_FILE   = "de440.eph"           # file name inside EPHE_PATH; de441 covers -13200..17191, de440 covers 1550..2650
+REQUIRE_EPHEMERIS = False           # True -> stop if swisseph silently falls back to a lower-quality ephemeris
 
 # ---- which events ------------------------------------------------------
 SHOW_RASHI     = True
@@ -71,6 +83,7 @@ SHOW_PADA      = False
 PRINT_TABLE    = True
 PRINT_TIME     = True
 PRINT_CALLS    = True
+PRINT_EPHEM    = True              # print which ephemeris / file was actually used
 SAVE_CSV       = False
 CSV_FILE       = "lagna_rigorous.csv"
 SHOW_LOCATION_COLUMN = None        # None -> only when more than one location
@@ -98,7 +111,13 @@ STEP_CLAMP   = 0.05                # days; largest single Newton move before a b
 GRID = 108
 STEP_DEG = 360.0 / GRID            # 3d20'
 SIDEREAL_DAY = 0.99726957
-FLAGS = swe.FLG_MOSEPH if EPHEMERIS == "moseph" else swe.FLG_SWIEPH
+_EPH_FLAG = {"swieph": swe.FLG_SWIEPH, "jpl": swe.FLG_JPLEPH, "moseph": swe.FLG_MOSEPH}
+if EPHEMERIS not in _EPH_FLAG:
+    raise ValueError(f'EPHEMERIS must be "swieph", "jpl" or "moseph" (got {EPHEMERIS!r})')
+EPH_WANT = _EPH_FLAG[EPHEMERIS]
+EPH_MASK = swe.FLG_JPLEPH | swe.FLG_SWIEPH | swe.FLG_MOSEPH
+EPH_NAME = {swe.FLG_JPLEPH: "JPL", swe.FLG_SWIEPH: "Swiss Ephemeris", swe.FLG_MOSEPH: "Moshier"}
+FLAGS = EPH_WANT                   # passed to houses_ex: drives Delta-T and ayanamsa
 if SIDEREAL:
     FLAGS |= swe.FLG_SIDEREAL
 elif EQUINOX_J2000:
@@ -143,9 +162,50 @@ def wrap180(x):
 
 def init_swe():
     if EPHE_PATH:
+        if not os.path.isdir(EPHE_PATH):
+            raise FileNotFoundError(f"EPHE_PATH is not a folder: {EPHE_PATH}")
         swe.set_ephe_path(EPHE_PATH)
+    if EPHEMERIS == "jpl":
+        full = JPL_FILE if os.path.isabs(JPL_FILE) else os.path.join(EPHE_PATH or "", JPL_FILE)
+        if not os.path.isfile(full):
+            raise FileNotFoundError(f"JPL file not found: {full}")
+        swe.set_jpl_file(JPL_FILE)
     if SIDEREAL:
         swe.set_sid_mode(getattr(swe, "SIDM_" + AYANAMSA))
+
+
+def preflight(t_lo, t_hi):
+    """houses_ex() gives no ephemeris flag back, so probe the ephemeris with calc_ut at
+    both ends of the solved range. Stops (REQUIRE_EPHEMERIS) or warns if swisseph fell
+    back to another ephemeris. Returns a one-line description of what is in use."""
+    for jd in (t_lo, t_hi):
+        try:
+            r = swe.calc_ut(float(jd), swe.SUN, EPH_WANT)
+        except swe.Error as e:
+            raise RuntimeError(f"swisseph failed at JD {jd:.5f} (EPHEMERIS={EPHEMERIS!r}): {e}") from None
+        if not isinstance(r[0], (tuple, list)):
+            WARN.append("old pyswisseph: ephemeris actually used cannot be verified")
+            break
+        got = r[1] & EPH_MASK
+        if got != EPH_WANT:
+            msg = (f"{EPH_NAME[EPH_WANT]} requested but swisseph used {EPH_NAME.get(got, '?')} "
+                   f"at JD {jd:.5f}; check EPHE_PATH, the files in it"
+                   + (f" and JPL_FILE={JPL_FILE!r}" if EPHEMERIS == "jpl" else "")
+                   + " and the date range")
+            if REQUIRE_EPHEMERIS:
+                raise RuntimeError(msg)
+            WARN.append(msg)
+            break
+    info = EPH_NAME[EPH_WANT]
+    if EPHEMERIS == "jpl" and hasattr(swe, "get_current_file_data"):
+        try:
+            path, start, end, denum = swe.get_current_file_data(0)
+            info += f" DE{denum}  {os.path.basename(path)}  covers JD {start:.1f} .. {end:.1f}"
+        except Exception:
+            info += f"  {JPL_FILE}"
+    elif EPHEMERIS == "swieph":
+        info += f"  path {EPHE_PATH or '(default)'}"
+    return info
 
 
 # ------------------------------------------------------------- site
@@ -366,6 +426,9 @@ if __name__ == "__main__":
         s_jd -= TZ_OFFSET_HOURS / 24.0
     lo, hi = s_jd, s_jd + DAYS
     init_swe()
+    eph_info = preflight(lo - PAD, hi + PAD)
+    if PRINT_EPHEM:
+        print(f"Ephemeris      : {eph_info}")
 
     sites = [Site(*loc) for loc in LOCATIONS]
     all_rows, total_calls, audit_calls = [], 0, 0
@@ -407,3 +470,4 @@ if __name__ == "__main__":
         n_ev = sum(1 for r in all_rows if r[2] == "Pada") or 1
         print(f"Ephemeris calls: {total_calls:,}"
               + (f"  (~{total_calls / n_ev:.1f} per pada event)" if SHOW_PADA else ""))
+    swe.close()

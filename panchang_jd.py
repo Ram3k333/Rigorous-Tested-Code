@@ -4,6 +4,13 @@ Panchanga boundaries in Julian Days (UT) -- LOCATION FREE
 swisseph only SAMPLES the Sun and Moon (coarse steps, with speed).
 All boundary times come from NumPy: cubic Hermite curve in each time cell + Newton.
 
+EPHEMERIS
+  "swieph" : Swiss Ephemeris .se1 files (sepl_*.se1 for the Sun, semo_*.se1 for the Moon)
+  "jpl"    : JPL DE file (de440.eph / de441.eph ...) read directly by swisseph
+  "moseph" : built-in Moshier, no files needed
+  With REQUIRE_EPHEMERIS = True every single swisseph call is checked: if swisseph had to
+  fall back (file missing, date outside the file's range) the run stops with a clear message.
+
 ONE GRID PER LIMB (angle in "grid units", 1 unit = 1 cell)
   Moon - Sun (6 deg)          -> Karana ;  Tithi = every 2nd line ; Paksha = every 30th
   Moon sidereal (3 deg 20')   -> Pada   ;  Nakshatra = every 4th, Rashi = every 9th
@@ -24,6 +31,7 @@ FIXED CLOCK TIME
 NOT HERE (location dependent): sunrise, sunset, dinmaan, vaar.
 """
 import math
+import os
 import time
 import csv
 import numpy as np
@@ -50,8 +58,10 @@ TZ_LABEL   = "IST"
 
 # ---- swisseph FLAGS ----------------------------------------------------
 AYANAMSA   = "LAHIRI"              # any swe.SIDM_<name>
-EPHEMERIS  = "swieph"              # "swieph" (files, falls back to Moshier) or "moseph"
-EPHE_PATH  = None                  # folder with .se1 files, or None
+EPHEMERIS  = "jpl"              # "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in, ~1" less accurate)
+EPHE_PATH  =  r"C:\Users\durva\PycharmProjects\Rigorous_Tested_Code"   # folder holding the .se1 files (sepl_18 + semo_18 for 1800-2400, *_24 for 2400-3000) and the JPL file if EPHEMERIS="jpl"
+JPL_FILE   = "de440.eph"           # file name inside EPHE_PATH; de441 covers -13200..17191, de440 covers 1550..2650
+REQUIRE_EPHEMERIS = True           # True -> stop if swisseph silently falls back to a lower-quality ephemeris
 TRUE_POSITION      = False         # True -> geometric (no light-time)
 NO_ABERRATION      = False         # True -> skip annual aberration
 NO_GRAV_DEFLECTION = False         # True -> skip Sun light deflection
@@ -99,6 +109,7 @@ PRINT_TABLE    = True
 PRINT_SUN      = True              # Surya spashta at SUN_FIXED_TIMES
 PRINT_TIME     = True
 PRINT_CALLS    = True
+PRINT_EPHEM    = True              # print which ephemeris / file was actually used
 SAVE_CSV       = True
 CSV_NAME       = "panchanga_jd.csv"
 
@@ -117,8 +128,14 @@ STRICT     = False                 # True -> any warning is a hard error
 SUN, MOON = swe.SUN, swe.MOON
 
 # ---- FLAGS -------------------------------------------------------------
-BASE = swe.FLG_MOSEPH if EPHEMERIS == "moseph" else swe.FLG_SWIEPH
-BASE |= swe.FLG_SPEED
+_EPH_FLAG = {"swieph": swe.FLG_SWIEPH, "jpl": swe.FLG_JPLEPH, "moseph": swe.FLG_MOSEPH}
+if EPHEMERIS not in _EPH_FLAG:
+    raise ValueError(f'EPHEMERIS must be "swieph", "jpl" or "moseph" (got {EPHEMERIS!r})')
+EPH_WANT = _EPH_FLAG[EPHEMERIS]
+EPH_MASK = swe.FLG_JPLEPH | swe.FLG_SWIEPH | swe.FLG_MOSEPH
+EPH_NAME = {swe.FLG_JPLEPH: "JPL", swe.FLG_SWIEPH: "Swiss Ephemeris", swe.FLG_MOSEPH: "Moshier"}
+
+BASE = EPH_WANT | swe.FLG_SPEED
 if TRUE_POSITION:      BASE |= swe.FLG_TRUEPOS
 if NO_ABERRATION:      BASE |= swe.FLG_NOABERR
 if NO_GRAV_DEFLECTION: BASE |= swe.FLG_NOGDEFL
@@ -220,14 +237,39 @@ def local_year(jd):
 # ----------------------------------------------------- ephemeris wrappers
 CALLS = 0
 WARN = []
+EPH_USED = {}            # ephemeris actually used -> number of calls
+_FALLBACK_SEEN = False
 
 
 def _calc(jd, body, flags):
-    """(longitude, speed). Counted. Works with old and new pyswisseph return shapes."""
-    global CALLS
+    """(longitude, speed). Counted. Works with old and new pyswisseph return shapes.
+    Checks the RETURN flag: swisseph silently falls back JPL -> SWIEPH -> MOSEPH when a
+    file is missing or the date is outside the file's range."""
+    global CALLS, _FALLBACK_SEEN
     CALLS += 1
-    r = swe.calc_ut(float(jd), body, flags)
-    xx = r[0] if isinstance(r[0], (tuple, list)) else r
+    try:
+        r = swe.calc_ut(float(jd), body, flags)
+    except swe.Error as e:
+        raise RuntimeError(f"swisseph failed at JD {jd:.5f} (body {body}, EPHEMERIS={EPHEMERIS!r}): {e}") from None
+    if isinstance(r[0], (tuple, list)):          # pyswisseph >= 2: (xx, retflag)
+        xx, ret = r[0], r[1]
+        got = ret & EPH_MASK
+        EPH_USED[got] = EPH_USED.get(got, 0) + 1
+        if got != EPH_WANT:
+            msg = (f"{EPH_NAME[EPH_WANT]} requested but swisseph used {EPH_NAME.get(got, '?')} "
+                   f"at JD {jd:.5f} (body {body}); check EPHE_PATH, the files in it"
+                   + (f" and JPL_FILE={JPL_FILE!r}" if EPHEMERIS == "jpl" else "")
+                   + " and the date range")
+            if REQUIRE_EPHEMERIS:
+                raise RuntimeError(msg)
+            if not _FALLBACK_SEEN:
+                WARN.append(msg)
+                _FALLBACK_SEEN = True
+    else:                                        # very old pyswisseph: xx only, no flag
+        xx = r
+        if not _FALLBACK_SEEN:
+            WARN.append("old pyswisseph: ephemeris actually used cannot be verified")
+            _FALLBACK_SEEN = True
     return xx[0], xx[3]
 
 
@@ -240,8 +282,36 @@ def sample(body, flags, t):
 
 def init():
     if EPHE_PATH:
+        if not os.path.isdir(EPHE_PATH):
+            raise FileNotFoundError(f"EPHE_PATH is not a folder: {EPHE_PATH}")
         swe.set_ephe_path(EPHE_PATH)
+    if EPHEMERIS == "jpl":
+        full = JPL_FILE if os.path.isabs(JPL_FILE) else os.path.join(EPHE_PATH or "", JPL_FILE)
+        if not os.path.isfile(full):
+            raise FileNotFoundError(f"JPL file not found: {full}")
+        swe.set_jpl_file(JPL_FILE)
     swe.set_sid_mode(getattr(swe, "SIDM_" + AYANAMSA))
+
+
+def preflight(a, b):
+    """Touch the ephemeris at both ends of the range that build() will sample, for the Sun
+    and the Moon, so a missing file or an out-of-range date fails at once (not after
+    thousands of calls). Returns a one-line description of what is in use."""
+    ends = (a - SUN_EXTRA - 1.0, b + 2 * SUN_STEP + SUN_EXTRA + 1.0)
+    bodies = [SUN] + ([MOON] if NEED_MOON_SERIES or POLISH else [])
+    for jd in ends:
+        for body in bodies:
+            _calc(jd, body, FLAGS_SID)
+    info = EPH_NAME[EPH_WANT]
+    if EPHEMERIS == "jpl" and hasattr(swe, "get_current_file_data"):
+        try:
+            path, start, end, denum = swe.get_current_file_data(0)
+            info += f" DE{denum}  {os.path.basename(path)}  covers JD {start:.1f} .. {end:.1f}"
+        except Exception:
+            info += f"  {JPL_FILE}"
+    elif EPHEMERIS == "swieph":
+        info += f"  path {EPHE_PATH or '(default)'}"
+    return info
 
 
 def wrap180(x):
@@ -698,6 +768,9 @@ if __name__ == "__main__":
     need_cal = SHOW_MASA or SHOW_MASA_PURN or SHOW_YEAR
     pad_back = max(PAD, MASA_PAD_BACK if need_cal else 0.0)
     pad_fwd = max(PAD, MASA_PAD_FWD if need_cal else 0.0)
+    eph_info = preflight(lo - pad_back, hi + pad_fwd)
+    if PRINT_EPHEM:
+        print(f"Ephemeris      : {eph_info}")
     db = build(lo - pad_back, hi + pad_fwd)
     months = build_months(db) if need_cal else []
     suns = sun_fixed(lo, hi) if SUN_FIXED_TIMES else []
@@ -729,4 +802,6 @@ if __name__ == "__main__":
     if PRINT_TIME:
         print(f"Execution time : {elapsed:.3f} s (excl. audit)")
     if PRINT_CALLS:
-        print(f"Ephemeris calls: {CALLS:,} (incl. audit)")
+        used = ", ".join(f"{EPH_NAME.get(k, '?')} {v:,}" for k, v in EPH_USED.items())
+        print(f"Ephemeris calls: {CALLS:,} (incl. audit)" + (f"  [{used}]" if used else ""))
+    swe.close()

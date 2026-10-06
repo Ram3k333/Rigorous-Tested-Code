@@ -40,7 +40,7 @@ from concurrent.futures import ProcessPoolExecutor
 # ---- time range (Julian Day, UT; no datetime used) --------------------
 START_DATE = (1900, 1, 1, 0.0)     # (year, month, day, hour) -> converted with swe.julday
 START_JD   = None                  # set a JD here to override START_DATE
-DAYS       = 219146                   # length of range
+DAYS       = 365                   # length of range
 PAD        = 3.0                   # compute this many days outside the range (edge safety)
 START_DATE_IS_LOCAL = True         # True -> START_DATE is IST (TZ_OFFSET_HOURS), not UT
 
@@ -57,8 +57,8 @@ EQUINOX_J2000 = False              # tropical only: fixed J2000 ecliptic instead
 NODE_TYPE  = "mean"                # "mean" (smooth) or "true" (wobbling, has stations)
 
 # ---- ephemeris / position model ----------------------------------------
-EPHEMERIS  = "swieph"              # "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in, ~1" less accurate)
-EPHE_PATH  = r"C:\Users\durva\PycharmProjects\Rigorous_Tested_Code"   # folder holding sepl_18.se1 + sepl_24.se1 (and the JPL file if EPHEMERIS="jpl")
+EPHEMERIS  = "jpl"              # "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in, ~1" less accurate)
+EPHE_PATH  =  r"C:\Users\durva\PycharmProjects\Rigorous_Tested_Code"   # folder holding sepl_18.se1 + sepl_24.se1 (and the JPL file if EPHEMERIS="jpl")
 JPL_FILE   = "de440.eph"           # file name inside EPHE_PATH; de441 covers -13200..17191, de440 covers 1550..2650
 REQUIRE_EPHEMERIS = True           # True -> stop if swisseph silently falls back to a lower-quality ephemeris
 TOPOCENTRIC = False                # True -> observer-based (Moon parallax up to ~1 deg)
@@ -69,8 +69,8 @@ NO_GRAV_DEFLECTION = True          # True -> skip Sun light deflection (needed: 
 
 # ---- which bodies ------------------------------------------------------
 BODY_ON = {
-    "Sun": True, "Moon": False, "Mercury": True, "Venus": True, "Mars": True,
-    "Jupiter": True, "Saturn": True, "Uranus": True, "Neptune": True, "Pluto": True,
+    "Sun": True, "Moon": False, "Mercury": False, "Venus": False, "Mars": False,
+    "Jupiter": True, "Saturn": True, "Uranus": False, "Neptune": False, "Pluto": False,
     "Rahu": True, "Ketu": True,
 }
 
@@ -750,3 +750,5 @@ if __name__ == "__main__":
         print(f"Execution time : {elapsed:.3f} s (excl. audit)")
     if PRINT_CALLS:
         print(f"Ephemeris calls: {calls:,}")
+
+    swe.close()
