@@ -1,0 +1,165 @@
+------------------------------Ingress Default---------------------------------------------
+
+# ---- coordinate system ------------------------------------------------
+SIDEREAL   = True                  # Abhijit needs sidereal. False -> tropical longitudes
+AYANAMSA   = "LAHIRI"              # any swe.SIDM_<name> (used only if SIDEREAL)
+EQUINOX_J2000 = False              # tropical only: fixed J2000 ecliptic instead of "of date"
+NODE_TYPE  = "mean"                # "mean" (smooth) or "true" (wobbling, has stations)
+
+# ---- ephemeris / position model ----------------------------------------
+EPHEMERIS  = "jpl"              # "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in, ~1" less accurate)
+EPHE_PATH  =  r"C:\Users\durva\PycharmProjects\Rigorous_Tested_Code"   # folder holding sepl_18.se1 + sepl_24.se1 (and the JPL file if EPHEMERIS="jpl")
+JPL_FILE   = "de440.eph"           # file name inside EPHE_PATH; de441 covers -13200..17191, de440 covers 1550..2650
+REQUIRE_EPHEMERIS = True           # True -> stop if swisseph silently falls back to a lower-quality ephemeris
+
+TOPOCENTRIC = False                # True -> observer-based (Moon parallax up to ~1 deg)
+TOPO_LON, TOPO_LAT, TOPO_ALT = 75.8577, 22.7196, 553.0   # used only if TOPOCENTRIC
+TRUE_POSITION      = False         # True -> geometric (no light-time)
+NO_ABERRATION      = False         # True -> skip annual aberration
+NO_GRAV_DEFLECTION = True          # True -> skip Sun light deflection (needed: makes planet paths smooth near Sun conjunction)
+
+# ---- which bodies ------------------------------------------------------
+BODY_ON = {
+    "Sun": True, "Moon": True, "Mercury": True, "Venus": True, "Mars": True,
+    "Jupiter": True, "Saturn": True, "Uranus": True, "Neptune": True, "Pluto": True,
+    "Rahu": True, "Ketu": True,
+}
+
+# ---- which events ------------------------------------------------------
+SHOW_RASHI           = False
+SHOW_NAKSHATRA       = False        # (tropical mode: still computed, but not meaningful)
+SHOW_PADA            = True
+SHOW_ABHIJIT         = True        # Abhijit entry/exit (use with SIDEREAL = True)
+SHOW_ABHIJIT_PADA    = True         # when entering Abhijit pada 1..4 (use with SIDEREAL = True)
+ABHIJIT_START_DEG    = 276 + 40/60             # 6°40' Makara (start of U.Ashadha pada 4)
+ABHIJIT_END_DEG      = 280 + 53/60 + 20/3600   # 10°53'20" Makara
+SHOW_VAKRI           = True        # retrograde stations
+SHOW_MARGI           = True        # direct stations
+SHOW_RETRO_REENTRY   = True        # False -> hide backward (retrograde) boundary crossings
+
+# ---- rigor / verification ---------------------------------------------
+RUN_CHECK       = True             # continuity of crossings + station alternation
+AUDIT_STEP      = 5.0              # days between true-ephemeris audit samples (0 = off)
+STRICT          = False             # True -> any warning is a hard error
+
+
+----------------------------Mahapata Default---------------------------------------------
+
+# ---- ephemeris / position model ----------------------------------------
+EPHEMERIS  = "jpl"              # "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in)
+EPHE_PATH  =  r"C:\Users\durva\PycharmProjects\Rigorous_Tested_Code" # folder holding sepl_18/semo_18 (+ _24) .se1 (and the JPL file if "jpl")
+JPL_FILE   = "de440.eph"           # file name inside EPHE_PATH
+REQUIRE_EPHEMERIS = True           # True -> stop if swisseph silently falls back to a lower-quality ephemeris
+
+TRUE_POSITION      = False         # True -> geometric (no light-time)
+NO_ABERRATION      = False         # True -> skip annual aberration
+NO_GRAV_DEFLECTION = False         # True -> skip light deflection (negligible for Sun/Moon)
+NO_NUTATION        = False         # True -> mean equator of date instead of true equator
+                                   # (keep False: traditional kranti = true declination)
+
+# ---- longitude display (does NOT affect the calculation) ---------------
+LON_MODE   = "tropical"            # "tropical", "sidereal" or "both"
+AYANAMSA   = "LAHIRI"              # any swe.SIDM_<name> (used only for sidereal display)
+ANGLE_FORMAT   = "decimal"             # "dms" (23°26'12.3") or "decimal"
+ANGLE_DECIMALS = 6                 # decimals in "decimal" mode
+LANGUAGE   = "english"             # "english" or "hindi" (paat / ayan / gol names)
+
+# ---- mahapata rules -----------------------------------------------------
+EDGE_METHOD   = "exact"            # "exact" (solve |g| = yogardh) or "linear" (Surya Siddhanta style)
+SEMI_DIAMETER = "true"             # "true" (from distance, = pheno_ut) or "mean" (fixed values below)
+SUN_RADIUS_KM  = 696000.0          # Swiss Ephemeris value (diameter 1392000 km)
+MOON_RADIUS_KM = 1737.4
+MEAN_SUN_SD_DEG  = 15 / 60 + 59.6 / 3600   # 15'59.6"  (used only if SEMI_DIAMETER = "mean")
+MEAN_MOON_SD_DEG = 15 / 60 + 32.6 / 3600   # 15'32.6"
+EDGE_MAX_DAYS = 5.0                # search limit for prarambh / samapti on each side
+                                   # (longest side seen 1990-2030: 2.4 days; NO_EDGE flag if exceeded)
+SHOW_FLAG_COLUMN    = True         # False -> no Flag column at all
+
+# Each condition, one of:
+#   "show"    -> keep the event, write the flag in the Flag column
+#   "hide"    -> keep the event, condition is NOT calculated, no flag
+#   "exclude" -> event is REMOVED from the list (its edges/longitudes are not polished)
+
+FLAG_MODE = {
+    "NO_EDGE":       "show",       # edge not found within EDGE_MAX_DAYS
+    "TURN":          "show",       # Sun-Moon declination gap reverses inside the pata
+    "SUN_AYAN_CHG":  "show",       # solstice inside the pata
+    "MOON_AYAN_CHG": "show",       # Moon's max/min declination inside the pata
+    "SUN_GOL_CHG":   "show",       # Sun crosses the equator inside the pata
+    "MOON_GOL_CHG":  "show",       # Moon crosses the equator inside the pata
+}
+SHOW_OTHER_CROSSINGS = False       # True -> also list non-Mahapata parallel / contraparallel crossings
+
+# ---- rigor / verification ---------------------------------------------
+RUN_CHECK   = True                 # crossing-direction alternation check
+AUDIT_STEP  = 2.0                  # days between true-ephemeris audit samples (0 = off)
+STRICT      = False                # True -> any warning is a hard error
+
+# ---- performance / accuracy -------------------------------------------
+WORKERS   = 4
+CHUNK     = 365.25                 # days per worker task
+WIN_SUN,  DEG_SUN  = 20.0, 16      # fit window (days) / Chebyshev degree
+WIN_MOON, DEG_MOON = 8.0, 20
+TOL       = 1e-7                   # max tail coefficient (deg) before a window is split
+VAL_TOL   = 1e-6                   # max error (deg) at held-out validation points
+MIN_WIN   = 0.05
+POLISH    = True                   # re-solve madhya and edges against the true ephemeris
+# ======================== END CONFIG ================================
+
+
+----------------------------Panchang Default---------------------------------------------
+
+# ---- swisseph FLAGS ----------------------------------------------------
+AYANAMSA   = "LAHIRI"              # any swe.SIDM_<name>
+EPHEMERIS  = "jpl"              # "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in, ~1" less accurate)
+EPHE_PATH  =  r"C:\Users\durva\PycharmProjects\Rigorous_Tested_Code"
+JPL_FILE   = "de440.eph"           # file name inside EPHE_PATH; de441 covers -13200..17191, de440 covers 1550..2650
+REQUIRE_EPHEMERIS = True           # True -> stop if swisseph silently falls back to a lower-quality ephemeris
+
+TRUE_POSITION      = False         # True -> geometric (no light-time)
+NO_ABERRATION      = False         # True -> skip annual aberration
+NO_GRAV_DEFLECTION = False         # True -> skip Sun light deflection
+# (no TOPOCENTRIC option on purpose: it would make the result location dependent)
+
+# ---- which events ------------------------------------------------------
+SHOW_TITHI       = False
+SHOW_KARANA      = True
+SHOW_PAKSHA      = False
+SHOW_NAKSHATRA   = False
+SHOW_PADA        = True
+SHOW_RASHI       = False             # Chandra rashi
+SHOW_YOGA        = True
+SHOW_SANKRANTI   = True             # Sun enters sidereal rashi
+SHOW_GOLA        = True             # Uttara / Dakshina gola  (sayana)
+SHOW_AYANA       = True             # Uttarayana / Dakshinayana (sayana)
+SHOW_RITU_SAYANA   = True           # ritu from tropical Sun
+SHOW_RITU_NIRAYANA = True          # ritu from sidereal Sun
+RITU_SAYANA_START   = 330.0        # tropical longitude where Vasanta begins
+RITU_NIRAYANA_START = 0.0          # sidereal longitude where Vasanta begins
+
+# ---- lunar calendar: masa / year ---------------------------------------
+SHOW_MASA            = True        # Masa (amanta) rows
+SHOW_MASA_PURN       = True        # Purnimanta masa rows
+SHOW_YEAR            = True        # Shaka, Vikram, Samvatsara rows
+SAMVATSARA_CYCLE     = "north"     # "north" (Barhaspatya, mean Jupiter) or "south" (from Shaka)
+VIKRAM_START         = "chaitra"   # "chaitra" or "kartika" (Gujarat)
+YEAR_START_AT_ADHIKA = True        # True: an Adhika Chaitra/Kartika opens the year (shastra rule)
+                                   # False: the year opens with the Nija month
+NORTH_SHIFT_DAYS     = 3.9         # calibration of the north cycle (see samvatsara_north)
+MASA_PAD_BACK = 400.0              # days before START: to find the Chaitra that opened the year
+MASA_PAD_FWD  = 400.0              # days after END: to find the Chaitra that closes the year
+
+# ---- Surya spashta at fixed local clock times ---------------------------
+SUN_FIXED_TIMES = [05:30]   # local "HH:MM" (TZ_OFFSET_HOURS); [] = off
+
+# ---- sampling / accuracy ----------------------------------------------
+MOON_STEP = 0.5                    # days. 1.0 = half the calls, ~1 s error;  0.5 ~ 0.05 s
+SUN_STEP  = 4.0                    # days. Sun is smooth; interpolated onto the Moon grid
+POLISH    = True                  # True -> re-solve every Moon-grid root on the REAL ephemeris
+POLISH_MAX_SHIFT = 0.05            # days; bigger shift from the fitted root is rejected
+
+# ---- verification ------------------------------------------------------
+RUN_CHECK  = True                  # continuity + ephemeris audit + masa audit
+AUDIT_STEP = 5.0                   # days between true-ephemeris audit samples (0 = off)
+STRICT     = False                 # True -> any warning is a hard error
+# ======================== END CONFIG ================================
