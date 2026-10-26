@@ -1,0 +1,517 @@
+"""
+Apogee / perigee events in Julian Days (Sun..Pluto) -- RIGOROUS edition
+=======================================================================
+Events (geocentric distance)
+  APOGEE   local maximum of the Earth-body distance (farthest point of this swing)
+  PERIGEE  local minimum of the Earth-body distance (closest point of this swing)
+
+For the Moon these are the usual lunar apogee/perigee. For the Sun they are the
+geocentric form of the Earth's aphelion/perihelion (early July / early January).
+For the planets they are the farthest point near conjunction and the closest
+approach near opposition (Mercury/Venus: near superior/inferior conjunction).
+
+Same flag-controlled design as the longitude script: swisseph only samples,
+roots come from NumPy Chebyshev polynomials, every event is re-solved against
+the real ephemeris, and the result is proved complete before it is printed.
+
+LAYERS OF RIGOR
+ 1. FIT VALIDATION   - window accepted only if tail coefficients are small AND the
+                       polynomial matches swisseph at 7 held-out points
+                       (tolerances are relative to the distance itself).
+ 2. STATIONARY POINTS- found twice (eigenvalue roots AND a dense sign scan); each
+                       candidate is kept only if the radial speed changes sign.
+ 3. SEAM OVERLAP     - windows evaluated on [-1-EXT, 1+EXT]; duplicates merged.
+ 4. POLISH           - every APOGEE/PERIGEE re-solved by bisection on the TRUE
+                       swisseph radial speed.
+ 5. CONTINUITY CHECK - APOGEE and PERIGEE must alternate, and every APOGEE must
+                       be farther than the PERIGEEs on either side of it.
+ 6. INDEPENDENT AUDIT- true radial speed read from swisseph every AUDIT_STEP days;
+                       replaying the events between two samples must land on the
+                       true direction (receding / approaching).
+
+NOTES
+ * Distance does not depend on the zodiac or on the equator, so there is no
+   SIDEREAL / J2000 switch.
+ * Rahu/Ketu are not offered: a node is a direction, not a body, so it has no
+   meaningful distance.
+ * TOPOCENTRIC = True measures from the observer, not the Earth's centre; the
+   Moon's distance then swings by up to ~6,400 km every day, giving a near-daily
+   APOGEE/PERIGEE. Published lunar apogee/perigee times are geocentric.
+"""
+import time
+import bisect
+import csv
+import numpy as np
+import swisseph as swe
+from numpy.polynomial import chebyshev as C
+from concurrent.futures import ProcessPoolExecutor
+
+# =====================================================================
+#                              CONFIG
+# =====================================================================
+# ---- time range (Julian Day, UT; no datetime used) --------------------
+START_DATE = (2026, 1, 1, 0.0)    # (year, month, day, hour) -> converted with swe.julday
+START_JD   = None                  # set a JD here to override START_DATE
+DAYS       = 365                   # length of range
+PAD        = 3.0                   # compute this many days outside the range (edge safety)
+START_DATE_IS_LOCAL = True         # True -> START_DATE is IST (TZ_OFFSET_HOURS), not UT
+
+# ---- time display -----------------------------------------------------
+SHOW_JD    = False                 # JD (UT) column
+SHOW_IST   = True                  # local time column: YYYY-MM-DD HH:MM:SS
+TZ_OFFSET_HOURS = 5.5              # IST = UT + 5:30 (change for another zone)
+TZ_LABEL   = "IST"                 # column heading
+
+# ---- ephemeris / position model ----------------------------------------
+EPHEMERIS  = "jpl"                 # "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in)
+EPHE_PATH  = r"D:\ephe"   # folder with the .se1 / JPL files
+JPL_FILE   = "de440.eph"           # file name inside EPHE_PATH; de440 covers 1550..2650
+REQUIRE_EPHEMERIS = True           # True -> stop if swisseph silently falls back to a lower-quality ephemeris
+
+TOPOCENTRIC = False                # True -> observer-based distance (see NOTES)
+TOPO_LON, TOPO_LAT, TOPO_ALT = 75.8577, 22.7196, 553.0   # used only if TOPOCENTRIC
+TRUE_POSITION      = False         # True -> geometric (no light-time)
+NO_ABERRATION      = False         # True -> skip annual aberration
+NO_GRAV_DEFLECTION = True          # True -> skip Sun light deflection
+
+# ---- which bodies ------------------------------------------------------
+BODY_ON = {
+    "Sun": False, "Moon": True, "Mercury": False, "Venus": False, "Mars": False,
+    "Jupiter": False, "Saturn": False, "Uranus": False, "Neptune": False, "Pluto": False,
+}
+
+# ---- which events ------------------------------------------------------
+SHOW_APOGEE  = True
+SHOW_PERIGEE = True
+
+# ---- output ------------------------------------------------------------
+PRINT_TABLE  = True
+PRINT_TIME   = True
+PRINT_CALLS  = True
+SHOW_VALUE   = True                # distance reached, on every row
+DIST_UNIT    = "auto"              # "auto" (km for the Moon, AU otherwise), "km" or "au"
+SORT_BY      = "time"              # "body" (grouped) or "time" (one chronological list)
+JD_DECIMALS  = 8
+CSV_FILE     = "apogee_perigee_events.csv"   # None -> no CSV
+
+# ---- rigor / verification ---------------------------------------------
+RUN_CHECK  = True                  # alternation check + ephemeris audit
+AUDIT_STEP = 2.0                   # days between true-ephemeris audit samples (0 = off)
+STRICT     = False                 # True -> any warning is a hard error
+
+# ---- performance / accuracy -------------------------------------------
+WORKERS   = 4
+CHUNK     = 180.0
+DEG       = 12
+TOL_REL   = 1e-10                  # max tail coefficient, as a fraction of the distance
+VAL_TOL_REL = 1e-9                 # max error at held-out points, as a fraction of the distance
+MIN_WIN   = 0.05
+WINDOW_OVERRIDE = {}
+POLISH    = True                   # re-solve every event against the true ephemeris
+# ======================== END CONFIG ================================
+
+# ---- internal constants ------------------------------------------------
+EXT = 1e-7                         # window overlap in x (seam safety)
+DEDUPE_DAYS = 1e-3                 # same kind as the previous event and closer than this = seam duplicate
+ROOT_TOL = 1e-8                    # days; final precision of every polished event (~1 ms)
+AUDIT_MARGIN = 1e-4                # days kept between an audit sample and any event
+VAL_X = np.array([-0.93, -0.71, -0.37, 0.11, 0.43, 0.77, 0.96])
+SCAN_X = np.linspace(-1.0, 1.0, 129)
+AU_KM = 149597870.700
+
+QI = 2                             # swe.calc_ut index: 2 = distance in AU (its speed is QI + 3)
+EV = {"MAX": "APOGEE", "MIN": "PERIGEE"}
+
+ORDER = ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn",
+         "Uranus", "Neptune", "Pluto"]
+ID = {"Sun": swe.SUN, "Moon": swe.MOON, "Mercury": swe.MERCURY, "Venus": swe.VENUS,
+      "Mars": swe.MARS, "Jupiter": swe.JUPITER, "Saturn": swe.SATURN,
+      "Uranus": swe.URANUS, "Neptune": swe.NEPTUNE, "Pluto": swe.PLUTO}
+_win = {"Sun": 10.0, "Moon": 4.0, "Mercury": 8.0, "Venus": 12.0, "Mars": 24.0,
+        "Jupiter": 48.0, "Saturn": 60.0, "Uranus": 90.0, "Neptune": 120.0,
+        "Pluto": 120.0}
+_win.update(WINDOW_OVERRIDE)
+
+ACTIVE = [nm for nm in ORDER if BODY_ON.get(nm)]
+
+EPH_FLAG = {"swieph": swe.FLG_SWIEPH, "jpl": swe.FLG_JPLEPH, "moseph": swe.FLG_MOSEPH}[EPHEMERIS]
+EPH_NAME = {swe.FLG_SWIEPH: "Swiss Ephemeris files", swe.FLG_JPLEPH: "JPL " + JPL_FILE,
+            swe.FLG_MOSEPH: "Moshier (built-in)"}
+FLAGS = EPH_FLAG
+if TOPOCENTRIC:        FLAGS |= swe.FLG_TOPOCTR
+if TRUE_POSITION:      FLAGS |= swe.FLG_TRUEPOS
+if NO_ABERRATION:      FLAGS |= swe.FLG_NOABERR
+if NO_GRAV_DEFLECTION: FLAGS |= swe.FLG_NOGDEFL
+
+_k = np.arange(DEG + 1)
+NODES = -np.cos(np.pi * (_k + 0.5) / (DEG + 1))
+FIT_M = np.linalg.inv(C.chebvander(NODES, DEG))
+
+
+def jd_to_local(jd):
+    """JD (UT) -> 'YYYY-MM-DD HH:MM:SS' local. Integer seconds: no 60-s carry bugs."""
+    total = int(round((jd + TZ_OFFSET_HOURS / 24.0 + 0.5) * 86400.0))
+    day, sod = divmod(total, 86400)
+    y, m, d, _ = swe.revjul(float(day))
+    return f"{y:04d}-{m:02d}-{d:02d} {sod // 3600:02d}:{sod % 3600 // 60:02d}:{sod % 60:02d}"
+
+
+def fmt_value(name, v):
+    """Distance (given in AU) for the table."""
+    unit = DIST_UNIT if DIST_UNIT != "auto" else ("km" if name == "Moon" else "au")
+    if unit == "km":
+        return f"{v * AU_KM:,.3f} km"
+    return f"{v:.9f} AU"
+
+
+# ----------------------------------------------------- ephemeris wrappers
+CALLS = 0
+WARN = []
+
+
+def _used_eph(ret):
+    """Which ephemeris swisseph actually used, from its return flag."""
+    for f in (swe.FLG_JPLEPH, swe.FLG_SWIEPH, swe.FLG_MOSEPH):
+        if ret & f:
+            return f
+    return swe.FLG_MOSEPH
+
+
+def _calc(jd, body, flags):
+    """swe.calc_ut + guard: swisseph silently falls back (JPL -> SE -> Moshier)
+    when a file is missing or out of range, so stop instead of continuing."""
+    xx, ret = swe.calc_ut(jd, body, flags)
+    if REQUIRE_EPHEMERIS and not (ret & EPH_FLAG):
+        y, m, d, _ = swe.revjul(jd)
+        raise RuntimeError(
+            f"Ephemeris fallback at JD {jd:.5f} ({y:04d}-{m:02d}-{d:02d}): asked for "
+            f"{EPH_NAME[EPH_FLAG]}, got {EPH_NAME[_used_eph(ret)]}. "
+            f"Check EPHE_PATH={EPHE_PATH!r} contains the file covering this date.")
+    return xx
+
+
+def val(jd, body):
+    """Distance (AU). Counted."""
+    global CALLS
+    CALLS += 1
+    return _calc(jd, body, FLAGS)[QI]
+
+
+def spd(jd, body):
+    """True swisseph radial speed (AU/day), used for polishing and the audit. Counted."""
+    global CALLS
+    CALLS += 1
+    return _calc(jd, body, FLAGS | swe.FLG_SPEED)[QI + 3]
+
+
+def init_worker():
+    if EPHE_PATH:
+        swe.set_ephe_path(EPHE_PATH)
+    if EPHEMERIS == "jpl":
+        swe.set_jpl_file(JPL_FILE)
+    if TOPOCENTRIC:
+        swe.set_topo(TOPO_LON, TOPO_LAT, TOPO_ALT)
+
+
+# ------------------------------------------------------------- fitting
+def fit(body, a, b):
+    """Adaptive Chebyshev fit. A window is accepted only if the tail is small AND the
+    polynomial reproduces swisseph at held-out points (anti-aliasing validation).
+    Tolerances scale with the distance (c[0] ~ mean distance on the window)."""
+    half, mid = 0.5 * (b - a), 0.5 * (a + b)
+    v = np.array([val(mid + half * x, body) for x in NODES])
+    c = FIT_M @ v
+    scale = abs(c[0])
+    ok = max(abs(c[-1]), abs(c[-2])) <= TOL_REL * scale
+    if ok:
+        truth = np.array([val(mid + half * x, body) for x in VAL_X])
+        ok = np.max(np.abs(truth - C.chebval(VAL_X, c))) <= VAL_TOL_REL * scale
+    if ok:
+        return [(a, b, c)]
+    if (b - a) > MIN_WIN:
+        return fit(body, a, mid) + fit(body, mid, b)
+    WARN.append(f"fit not converged for body {body} on [{a:.4f},{b:.4f}] at MIN_WIN")
+    return [(a, b, c)]
+
+
+# ------------------------------------------------- polynomial utilities
+def _bisect_poly(p, xa, xb):
+    neg_a = C.chebval(xa, p) < 0
+    for _ in range(80):
+        xm = 0.5 * (xa + xb)
+        if (C.chebval(xm, p) < 0) == neg_a:
+            xa = xm
+        else:
+            xb = xm
+    return 0.5 * (xa + xb)
+
+
+def stationary_x(d):
+    """All candidate stationary points of the fitted curve (roots of derivative d),
+    from TWO independent methods: eigenvalue roots AND a dense sign-change scan.
+    Extra candidates are harmless (each one is verified before use)."""
+    cand = []
+    if len(d) > 1:
+        r = C.chebroots(d)
+        r = r[np.abs(r.imag) < 1e-6].real
+        cand = [float(x) for x in r if -1.0 - EXT <= x <= 1.0 + EXT]
+    g = C.chebval(SCAN_X, d)
+    neg = g < 0
+    for i in np.nonzero(neg[:-1] != neg[1:])[0]:
+        xa, xb = SCAN_X[i], SCAN_X[i + 1]
+        if not any(xa - 1e-9 <= x <= xb + 1e-9 for x in cand):
+            cand.append(_bisect_poly(d, xa, xb))
+    out = []
+    for x in sorted(cand):
+        if not out or x - out[-1] > 1e-9:
+            out.append(x)
+    return out
+
+
+# ----------------------------------------------------- root polishing
+def _bisect_true(f, lo, hi, f_lo):
+    """Bisection on a REAL function whose sign differs at lo and hi."""
+    pos_lo = f_lo >= 0
+    while hi - lo > ROOT_TOL:
+        m = 0.5 * (lo + hi)
+        if (f(m) >= 0) == pos_lo:
+            lo = m
+        else:
+            hi = m
+    return 0.5 * (lo + hi)
+
+
+def _polish_station(sf, jd_fit, is_max):
+    """Bisection on the true swisseph radial speed. APOGEE: + -> -. PERIGEE: - -> +."""
+    for h in (0.05, 0.2, 0.8):
+        sl, sr = sf(jd_fit - h), sf(jd_fit + h)
+        if (sl > 0 > sr) if is_max else (sl < 0 < sr):
+            return _bisect_true(sf, jd_fit - h, jd_fit + h, sl)
+    WARN.append(f"apogee/perigee polish bracket failed near JD {jd_fit:.5f}; kept fit root")
+    return jd_fit
+
+
+# ------------------------------------------------------------- solver
+def window_events(c, a, b, vf, sf):
+    """Every APOGEE/PERIGEE of one fitted window, polished against the real
+    ephemeris -> [(jd, 'MAX'|'MIN', distance_au)]."""
+    half, mid = 0.5 * (b - a), 0.5 * (a + b)
+    d = C.chebder(c)
+    ext = []
+    for x in stationary_x(d):
+        dl = float(C.chebval(x - 1e-6, d))
+        dr = float(C.chebval(x + 1e-6, d))
+        if (dl > 0) == (dr > 0):
+            continue                                         # touched zero, no sign change
+        is_max = dl > 0
+        jd = mid + half * x
+        if POLISH:
+            jd = _polish_station(sf, jd, is_max)
+            v = vf(jd)
+        else:
+            v = float(C.chebval(x, c))
+        ext.append((jd, "MAX" if is_max else "MIN", v))
+    return ext
+
+
+# --------------------------------------------------------------- jobs
+def job(args):
+    """One body over one time chunk (runs in a worker process)."""
+    global CALLS, WARN
+    CALLS = 0
+    WARN = []
+    init_worker()
+    nm, c0, c1 = args
+    body, W = ID[nm], _win[nm]
+    vf = lambda jd: val(jd, body)
+    sf = lambda jd: spd(jd, body)
+    ext = []
+    for i in range(int(np.ceil((c1 - c0) / W))):
+        a, b = c0 + i * W, min(c0 + (i + 1) * W, c1)
+        if b - a <= 1e-9:
+            continue
+        for wa, wb, c in fit(body, a, b):
+            ext += window_events(c, wa, wb, vf, sf)
+    return {nm + ":x": ext}, CALLS, WARN
+
+
+def _dedupe(rows):
+    """Merge seam duplicates: same kind as the previous kept event and closer than
+    DEDUPE_DAYS. Rows are (jd, kind, ...)."""
+    out = []
+    for r in sorted(rows, key=lambda r: r[0]):
+        if out and out[-1][1] == r[1] and r[0] - out[-1][0] < DEDUPE_DAYS:
+            continue
+        out.append(r)
+    return out
+
+
+def build(start, end):
+    edges = list(np.arange(start, end, CHUNK)) + [end]
+    tasks = [(nm, float(c0), float(c1)) for c0, c1 in zip(edges[:-1], edges[1:]) for nm in ACTIVE]
+    if WORKERS > 1:
+        with ProcessPoolExecutor(WORKERS) as ex:
+            res = list(ex.map(job, tasks))
+    else:
+        res = [job(t) for t in tasks]
+    db, calls, warns = {}, 0, []
+    for ev, n, w in res:
+        calls += n
+        warns += w
+        for k, rows in ev.items():
+            db.setdefault(k, []).extend(rows)
+    for k in db:
+        db[k] = _dedupe(db[k])
+    return db, calls, warns
+
+
+# ------------------------------------------------- verification layers
+def _sgn(v):
+    return None if v == 0.0 else (1 if v > 0 else -1)
+
+
+def step(move, e, k):
+    """Apply one event to the direction of motion (+1 receding, -1 approaching,
+    None = unknown). Raises AssertionError if the event cannot follow it."""
+    t, kind, v = e
+    rising = 1 if kind == "MAX" else -1                      # motion just before the event
+    other = EV["MIN" if kind == "MAX" else "MAX"]
+    assert move is None or move == rising, (
+        f"{k}: {EV[kind]} at JD {t:.5f} follows another {EV[kind]}: a {other} was skipped")
+    return -rising
+
+
+def check(db):
+    """Layer 5: APOGEE/PERIGEE alternate, and each APOGEE is farther than the
+    PERIGEEs next to it."""
+    for k in ACTIVE:
+        move, last = None, None
+        for e in db.get(k + ":x", []):
+            move = step(move, e, k)
+            if last is not None:
+                far, near = (e, last) if e[1] == "MAX" else (last, e)
+                assert far[2] > near[2], (f"{k}: APOGEE at JD {far[0]:.5f} is not farther than "
+                                          f"the PERIGEE at JD {near[0]:.5f}")
+            last = e
+
+
+def audit(db, lo, hi):
+    """Layer 6: independent proof against the real ephemeris. Read the true radial
+    speed every AUDIT_STEP days; replaying the events between two samples must
+    start from the first direction and land on the second."""
+    if AUDIT_STEP <= 0:
+        return 0
+    global CALLS
+    before = CALLS
+    for k in ACTIVE:
+        body = ID[k]
+        ev = db.get(k + ":x", [])
+        jds = [e[0] for e in ev]
+        prev_t = prev_move = None
+        for t in np.arange(lo, hi, AUDIT_STEP):
+            t = float(t)
+            i = bisect.bisect_left(jds, t - AUDIT_MARGIN)
+            while i < len(jds) and jds[i] < t + AUDIT_MARGIN:   # step off event times
+                t = jds[i] + AUDIT_MARGIN
+                i += 1
+            truth = _sgn(spd(t, body))
+            if prev_t is not None:
+                move = prev_move
+                for e in ev[bisect.bisect_right(jds, prev_t):bisect.bisect_right(jds, t)]:
+                    move = step(move, e, k)
+                assert move is None or truth is None or move == truth, (
+                    f"audit {k}: replay says {'receding' if move > 0 else 'approaching'} but the "
+                    f"ephemeris disagrees at JD {t:.5f} (window {prev_t:.5f}..{t:.5f}): event missed")
+            prev_t, prev_move = t, truth
+    return CALLS - before
+
+
+# ---------------------------------------------------------- tables
+def body_rows(db, name, lo, hi):
+    rows = []
+    for jd, kind, v in db.get(name + ":x", []):
+        if not lo <= jd < hi:
+            continue
+        if (kind == "MAX" and not SHOW_APOGEE) or (kind == "MIN" and not SHOW_PERIGEE):
+            continue
+        rows.append((jd, name, EV[kind], fmt_value(name, v) if SHOW_VALUE else ""))
+    return rows
+
+
+def _all_rows(db, lo, hi):
+    rows = []
+    for name in ACTIVE:
+        rows += sorted(body_rows(db, name, lo, hi))
+    if SORT_BY == "time":
+        rows.sort()
+    return rows
+
+
+def show(db, lo, hi):
+    rows = _all_rows(db, lo, hi)
+    w = 18 + JD_DECIMALS - 8
+    head = f"{'body':<9}{'event':<9}{'distance':<22}"
+    head += f"{'JD':>{w}}" if SHOW_JD else ""
+    head += f"  {TZ_LABEL:<19}" if SHOW_IST else ""
+    print(head)
+    for jd, name, ev, detail in rows:
+        line = f"{name:<9}{ev:<9}{detail:<22}"
+        line += f"{jd:>{w}.{JD_DECIMALS}f}" if SHOW_JD else ""
+        line += f"  {jd_to_local(jd):<19}" if SHOW_IST else ""
+        print(line)
+
+
+def save_csv(db, lo, hi, filename):
+    rows = _all_rows(db, lo, hi)
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        wr.writerow(["body", "event", "distance", "JD", TZ_LABEL])
+        for jd, name, ev, detail in rows:
+            wr.writerow([name, ev, detail, f"{jd:.{JD_DECIMALS}f}", jd_to_local(jd)])
+
+
+# --------------------------------------------------------------- main
+if __name__ == "__main__":
+    if not ACTIVE:
+        raise SystemExit("No body switched on in BODY_ON.")
+    s_jd = START_JD if START_JD is not None else swe.julday(*START_DATE)
+    if START_JD is None and START_DATE_IS_LOCAL:
+        s_jd -= TZ_OFFSET_HOURS / 24.0
+    lo, hi = s_jd, s_jd + DAYS
+    init_worker()
+
+    # ---- ephemeris pre-flight: every active body, every ~10 years, both ends
+    probe = list(np.arange(lo - PAD, hi + PAD, 3652.5)) + [hi + PAD]
+    for nm in ACTIVE:
+        for t in probe:
+            val(float(t), ID[nm])                  # raises if the file is missing/out of range
+    print(f"Ephemeris: {EPH_NAME[EPH_FLAG]}"
+          + (f"  (path: {EPHE_PATH})" if EPHE_PATH else "")
+          + ("  [fallback guard ON]" if REQUIRE_EPHEMERIS else "  [fallback guard OFF]"))
+
+    t0 = time.perf_counter()
+    db, calls, warns = build(lo - PAD, hi + PAD)
+    elapsed = time.perf_counter() - t0
+
+    if warns:
+        msg = f"{len(warns)} warning(s); first: {warns[0]}"
+        if STRICT:
+            raise RuntimeError(msg)
+        print("WARNING:", msg)
+
+    if RUN_CHECK:
+        check(db)
+        audit_calls = audit(db, lo, hi)
+        print(f"Verification passed: alternation check + ephemeris audit "
+              f"({audit_calls:,} audit calls)")
+
+    if PRINT_TABLE:
+        show(db, lo, hi)
+    if CSV_FILE:
+        save_csv(db, lo, hi, CSV_FILE)
+    if PRINT_TIME:
+        print(f"Execution time : {elapsed:.3f} s (excl. audit)")
+    if PRINT_CALLS:
+        print(f"Ephemeris calls: {calls:,}")
+
+    swe.close()
