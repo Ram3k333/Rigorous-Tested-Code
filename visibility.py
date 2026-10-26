@@ -69,7 +69,7 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("pyswisseph is required:  pip install pyswisseph")
 
-__version__ = "2.4"
+__version__ = "2.5"
 
 # --------------------------------------------------------------------------------------
 # DEFAULT RUN - used when the script is started with no command-line arguments
@@ -83,11 +83,12 @@ DEFAULT_RUN = {
     "elev": 527,             # metres
     "tz": 5.5,               # hours east of UTC (IST)
     "year": None,            # None = the current year
-    "method": "siddhanta",   # siddhanta | siddhanta-longitude | av-fixed | av-variable | av-altaz
+    "method": "av-fixed",   # siddhanta | siddhanta-longitude | av-fixed | av-variable | av-altaz
     "bodies": "moon,mercury,venus,mars,jupiter,saturn",
     "ephe": "ephe",          # folder with the .se1 files, relative to this script
     "html": "udaya_asta_report.html",   # written next to this script
     "csv": None,             # e.g. "udaya_asta.csv"
+    "txt": None,             # e.g. "udaya_asta.txt" - the console report saved to a file
     "diagrams": True,        # needs matplotlib and numpy
     "kalamsha": {},          # overrides, e.g. {"mercury": 13} or {"venus.EL": 9}
     "av_preset": "plsv",     # av-fixed values: "plsv" (Schoch 1928, as in Alcyone PLSV) or "ptolemy"
@@ -1155,8 +1156,9 @@ def make_console_safe() -> None:
             pass
 
 
-def print_report(eng: UdayaAstaEngine, year: int, results: Dict[int, List[Period]],
-                 crosscheck: bool, more: bool) -> None:
+def report_text(eng: UdayaAstaEngine, year: int, results: Dict[int, List[Period]],
+                crosscheck: bool, more: bool) -> str:
+    """The console report as one string (also written by --txt)."""
     out = io.StringIO()
     for k, v in settings_summary(eng, year, list(results)):
         print(f"{k:18s}: {v}", file=out)
@@ -1169,12 +1171,18 @@ def print_report(eng: UdayaAstaEngine, year: int, results: Dict[int, List[Period
     if more and periods:
         print("\n=== Details ===", file=out)
         print(text_table(*detail_rows(eng, periods, crosscheck)), file=out)
-    text = out.getvalue()
+    return out.getvalue()
+
+
+def print_report(text: str) -> None:
+    """Print line by line and flush each line: some Windows terminals (PyCharm, ConPTY)
+    drop part of a very large single write."""
     try:
         text.encode(getattr(sys.stdout, "encoding", None) or "utf-8")
     except (UnicodeEncodeError, LookupError):
         text = text.replace("°", " ")          # a console that cannot show the degree sign
-    print(text, end="")
+    for line in text.splitlines():
+        print(line, flush=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -1446,7 +1454,7 @@ def default_argv() -> List[str]:
         else:
             print(f"Note: ephemeris folder {ephe} not found - using the built-in Moshier "
                   f"ephemeris. Put sepl_18.se1 and semo_18.se1 there for full precision.\n")
-    for key in ("html", "csv"):
+    for key in ("html", "csv", "txt"):
         if d.get(key):
             args += [f"--{key}", d[key] if os.path.isabs(d[key]) else os.path.join(here, d[key])]
     if d.get("diagrams"):
@@ -1509,6 +1517,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--more", action="store_true", help="console: also print the detail table")
     ap.add_argument("--html", help="write an HTML report")
     ap.add_argument("--csv", help="write a CSV")
+    ap.add_argument("--txt", help="write the console report (all tables) to a UTF-8 text file")
     ap.add_argument("--diagrams", action="store_true", help="add visibility diagrams to the HTML")
     ap.add_argument("--png-dir", help="also save the diagrams as PNG files")
     a = ap.parse_args(argv)
@@ -1562,7 +1571,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             draw_diagram(eng, b, a.year, per,
                          filename=os.path.join(folder, f"{BODY_NAMES[b].lower()}_{a.year}.png"))
         written.append(f"Diagrams saved in {folder}")
-    print_report(eng, a.year, results, a.crosscheck, a.more)
+    text = report_text(eng, a.year, results, a.crosscheck, a.more)
+    if a.txt:
+        path = os.path.abspath(a.txt)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        written.append(f"Text report written to {path}")
+    print_report(text)
     if written:
         print("\n" + "\n".join(written))
 
