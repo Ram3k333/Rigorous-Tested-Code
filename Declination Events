@@ -1,0 +1,648 @@
+"""
+Declination events in Julian Days (Sun..Pluto, Rahu, Ketu) -- RIGOROUS edition
+==============================================================================
+Events (geocentric declination, true equator of date)
+  MAX_DECLINATION   local maximum: the body turns back towards the south
+                    (for the Sun: the June solstice)
+  MIN_DECLINATION   local minimum: the body turns back towards the north
+                    (for the Sun: the December solstice)
+  DECLINATION_ZERO  declination crosses 0, i.e. the body crosses the celestial
+                    equator: S->N (going north) or N->S (going south)
+                    (for the Sun: the equinoxes)
+
+Same flag-controlled design as the longitude script: swisseph only samples,
+roots come from NumPy Chebyshev polynomials, every event is re-solved against
+the real ephemeris, and the result is proved complete before it is printed.
+
+LAYERS OF RIGOR
+ 1. FIT VALIDATION   - window accepted only if tail coefficients are small AND the
+                       polynomial matches swisseph at 7 held-out points.
+ 2. MONOTONIC PIECES - each window is cut at every verified MAX/MIN; inside a piece
+                       "does declination cross 0?" is decided by the TRUE
+                       declination at the two ends, so a grazing MAX/MIN near 0
+                       cannot hide a crossing.
+ 3. SEAM OVERLAP     - windows evaluated on [-1-EXT, 1+EXT]; duplicates merged.
+ 4. POLISH           - MAX/MIN re-solved on the true declination speed, crossings
+                       on the true declination (always inside a true bracket).
+ 5. CONTINUITY CHECK - one state machine (side of the equator, direction of
+                       motion) replays every event: MAX/MIN alternate, crossings
+                       alternate, a crossing must go the way the body is moving,
+                       and every MAX/MIN must lie on the side the crossings say.
+ 6. INDEPENDENT AUDIT- true declination and true declination speed read from
+                       swisseph every AUDIT_STEP days; replaying the events
+                       between two samples must land on the true state.
+
+All events are always computed (the check needs every one of them); the SHOW_*
+flags only filter the table.
+
+NOTES
+ * Declination does not depend on the zodiac, so there is no SIDEREAL switch.
+   EQUATOR_J2000 = True measures from the mean J2000 equator instead of the true
+   equator of date.
+ * Ketu is the point opposite Rahu, so its declination is exactly minus Rahu's:
+   Rahu is fitted once, and Ketu's events are Rahu's with MAX<->MIN and the
+   crossing direction swapped. A mean node takes ~9.3 years from one extreme to
+   the other, so most one-year ranges show no Rahu/Ketu MAX/MIN at all.
+ * The Sun's DECLINATION_ZERO and MAX/MIN rows land within seconds / minutes of
+   the equinox and solstice instants (those are defined by longitude 0/90/180/270;
+   the Sun's tiny latitude moves the declination events slightly).
+ * TOPOCENTRIC = True adds the Moon's parallax (up to ~1 deg).
+"""
+import time
+import bisect
+import csv
+import numpy as np
+import swisseph as swe
+from numpy.polynomial import chebyshev as C
+from concurrent.futures import ProcessPoolExecutor
+
+# =====================================================================
+#                              CONFIG
+# =====================================================================
+# ---- time range (Julian Day, UT; no datetime used) --------------------
+START_DATE = (2026, 1, 1, 0.0)    # (year, month, day, hour) -> converted with swe.julday
+START_JD   = None                  # set a JD here to override START_DATE
+DAYS       = 365                   # length of range
+PAD        = 3.0                   # compute this many days outside the range (edge safety)
+START_DATE_IS_LOCAL = True         # True -> START_DATE is IST (TZ_OFFSET_HOURS), not UT
+
+# ---- time display -----------------------------------------------------
+SHOW_JD    = False                 # JD (UT) column
+SHOW_IST   = True                  # local time column: YYYY-MM-DD HH:MM:SS
+TZ_OFFSET_HOURS = 0              # IST = UT + 5:30 (change for another zone)
+TZ_LABEL   = "IST"                 # column heading
+
+# ---- coordinate system ------------------------------------------------
+EQUATOR_J2000 = False              # True -> declination from the mean J2000 equator
+NODE_TYPE  = "mean"                # "mean" (smooth) or "true" (wobbling)
+
+# ---- ephemeris / position model ----------------------------------------
+EPHEMERIS  = "jpl"                 # "swieph" (SE .se1 files), "jpl" (JPL DE file) or "moseph" (built-in)
+EPHE_PATH  = r"D:\ephe"   # folder with the .se1 / JPL files
+JPL_FILE   = "de440.eph"           # file name inside EPHE_PATH; de440 covers 1550..2650
+REQUIRE_EPHEMERIS = True           # True -> stop if swisseph silently falls back to a lower-quality ephemeris
+
+TOPOCENTRIC = False                # True -> observer-based (Moon parallax up to ~1 deg)
+TOPO_LON, TOPO_LAT, TOPO_ALT = 75.8577, 22.7196, 553.0   # used only if TOPOCENTRIC
+TRUE_POSITION      = False         # True -> geometric (no light-time)
+NO_ABERRATION      = False         # True -> skip annual aberration
+NO_GRAV_DEFLECTION = True          # True -> skip Sun light deflection (keeps paths smooth near the Sun)
+
+# ---- which bodies ------------------------------------------------------
+BODY_ON = {
+    "Sun": True, "Moon": True, "Mercury": False, "Venus": False, "Mars": False,
+    "Jupiter": False, "Saturn": False, "Uranus": False, "Neptune": False, "Pluto": False,
+    "Rahu": False, "Ketu": False,
+}
+
+# ---- which events ------------------------------------------------------
+SHOW_MAX_DECLINATION  = True
+SHOW_MIN_DECLINATION  = True
+SHOW_DECLINATION_ZERO = True
+ZERO_DIRECTION        = "both"     # "both", "north" (S->N only) or "south" (N->S only)
+
+# ---- output ------------------------------------------------------------
+PRINT_TABLE  = True
+PRINT_TIME   = True
+PRINT_CALLS  = True
+SHOW_VALUE   = True                # declination reached, on MAX/MIN rows
+VALUE_FORMAT = "dms"               # "dms" (+28°33'12.4") or "deg" (+28.553444 deg)
+SORT_BY      = "time"              # "body" (grouped) or "time" (one chronological list)
+JD_DECIMALS  = 8
+CSV_FILE     = "declination_events.csv"   # None -> no CSV
+
+# ---- rigor / verification ---------------------------------------------
+RUN_CHECK  = True                  # continuity check + ephemeris audit
+AUDIT_STEP = 2.0                   # days between true-ephemeris audit samples (0 = off)
+STRICT     = False                 # True -> any warning is a hard error
+
+# ---- performance / accuracy -------------------------------------------
+WORKERS   = 4
+CHUNK     = 180.0
+DEG       = 12
+TOL       = 1e-7                   # max tail coefficient (deg) before a window is split
+VAL_TOL   = 1e-6                   # max error (deg) at held-out validation points
+MIN_WIN   = 0.05
+WINDOW_OVERRIDE = {}
+POLISH    = True                   # re-solve every event against the true ephemeris
+# ======================== END CONFIG ================================
+
+# ---- internal constants ------------------------------------------------
+EXT = 1e-7                         # window overlap in x (seam safety)
+DEDUPE_DAYS = 1e-3                 # same kind as the previous event and closer than this = seam duplicate
+ROOT_TOL = 1e-8                    # days; final precision of every polished event (~1 ms)
+POLISH_MAX_SHIFT = 0.05            # days; a larger Newton shift -> bisect the true bracket instead
+AUDIT_MARGIN = 1e-4                # days kept between an audit sample and any event
+VAL_X = np.array([-0.93, -0.71, -0.37, 0.11, 0.43, 0.77, 0.96])
+SCAN_X = np.linspace(-1.0, 1.0, 129)
+
+QI = 1                             # swe.calc_ut index with FLG_EQUATORIAL: 1 = declination (speed at QI + 3)
+EV = {"MAX": "MAX_DECLINATION", "MIN": "MIN_DECLINATION", "ZERO": "DECLINATION_ZERO"}
+ZERO_TEXT = {1: "S->N (going north)", -1: "N->S (going south)"}
+FLIP = {"MAX": "MIN", "MIN": "MAX"}
+
+NODE = swe.MEAN_NODE if NODE_TYPE == "mean" else swe.TRUE_NODE
+ORDER = ["Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn",
+         "Uranus", "Neptune", "Pluto", "Rahu", "Ketu"]
+ID = {"Sun": swe.SUN, "Moon": swe.MOON, "Mercury": swe.MERCURY, "Venus": swe.VENUS,
+      "Mars": swe.MARS, "Jupiter": swe.JUPITER, "Saturn": swe.SATURN,
+      "Uranus": swe.URANUS, "Neptune": swe.NEPTUNE, "Pluto": swe.PLUTO,
+      "Rahu": NODE, "Ketu": NODE}
+SIGN = {"Ketu": -1.0}              # Ketu = antipode of Rahu -> declination negated
+_win = {"Sun": 10.0, "Moon": 4.0, "Mercury": 8.0, "Venus": 12.0, "Mars": 24.0,
+        "Jupiter": 48.0, "Saturn": 60.0, "Uranus": 90.0, "Neptune": 120.0,
+        "Pluto": 120.0, "Rahu": 30.0 if NODE_TYPE == "mean" else 5.0}
+_win.update(WINDOW_OVERRIDE)
+
+ACTIVE = [nm for nm in ORDER if BODY_ON.get(nm)]
+FIT_BODIES = [nm for nm in ACTIVE if nm != "Ketu"]
+if "Ketu" in ACTIVE and "Rahu" not in FIT_BODIES:
+    FIT_BODIES.append("Rahu")
+
+EPH_FLAG = {"swieph": swe.FLG_SWIEPH, "jpl": swe.FLG_JPLEPH, "moseph": swe.FLG_MOSEPH}[EPHEMERIS]
+EPH_NAME = {swe.FLG_SWIEPH: "Swiss Ephemeris files", swe.FLG_JPLEPH: "JPL " + JPL_FILE,
+            swe.FLG_MOSEPH: "Moshier (built-in)"}
+FLAGS = EPH_FLAG | swe.FLG_EQUATORIAL
+if EQUATOR_J2000:      FLAGS |= swe.FLG_J2000
+if TOPOCENTRIC:        FLAGS |= swe.FLG_TOPOCTR
+if TRUE_POSITION:      FLAGS |= swe.FLG_TRUEPOS
+if NO_ABERRATION:      FLAGS |= swe.FLG_NOABERR
+if NO_GRAV_DEFLECTION: FLAGS |= swe.FLG_NOGDEFL
+
+_k = np.arange(DEG + 1)
+NODES = -np.cos(np.pi * (_k + 0.5) / (DEG + 1))
+FIT_M = np.linalg.inv(C.chebvander(NODES, DEG))
+
+
+def jd_to_local(jd):
+    """JD (UT) -> 'YYYY-MM-DD HH:MM:SS' local. Integer seconds: no 60-s carry bugs."""
+    total = int(round((jd + TZ_OFFSET_HOURS / 24.0 + 0.5) * 86400.0))
+    day, sod = divmod(total, 86400)
+    y, m, d, _ = swe.revjul(float(day))
+    return f"{y:04d}-{m:02d}-{d:02d} {sod // 3600:02d}:{sod % 3600 // 60:02d}:{sod % 60:02d}"
+
+
+def fmt_value(v):
+    """Declination for the table: +28°33'12.4" (integer tenths: no 60" carry bugs) or decimal."""
+    if VALUE_FORMAT == "deg":
+        return f"{v:+.6f} deg"
+    t = int(round(abs(v) * 36000.0))
+    d, r = divmod(t, 36000)
+    m, r = divmod(r, 600)
+    return f"{'-' if v < 0 else '+'}{d}°{m:02d}'{r / 10:04.1f}\""
+
+
+# ----------------------------------------------------- ephemeris wrappers
+CALLS = 0
+WARN = []
+
+
+def _used_eph(ret):
+    """Which ephemeris swisseph actually used, from its return flag."""
+    for f in (swe.FLG_JPLEPH, swe.FLG_SWIEPH, swe.FLG_MOSEPH):
+        if ret & f:
+            return f
+    return swe.FLG_MOSEPH
+
+
+def _calc(jd, body, flags):
+    """swe.calc_ut + guard: swisseph silently falls back (JPL -> SE -> Moshier)
+    when a file is missing or out of range, so stop instead of continuing.
+    The mean node is an analytic formula (no file involved): no guard needed."""
+    xx, ret = swe.calc_ut(jd, body, flags)
+    if REQUIRE_EPHEMERIS and body != swe.MEAN_NODE and not (ret & EPH_FLAG):
+        y, m, d, _ = swe.revjul(jd)
+        raise RuntimeError(
+            f"Ephemeris fallback at JD {jd:.5f} ({y:04d}-{m:02d}-{d:02d}): asked for "
+            f"{EPH_NAME[EPH_FLAG]}, got {EPH_NAME[_used_eph(ret)]}. "
+            f"Check EPHE_PATH={EPHE_PATH!r} contains the file covering this date.")
+    return xx
+
+
+def val(jd, body):
+    """Declination (deg). Counted."""
+    global CALLS
+    CALLS += 1
+    return _calc(jd, body, FLAGS)[QI]
+
+
+def spd(jd, body):
+    """True swisseph declination speed (deg/day), used for MAX/MIN polishing. Counted."""
+    global CALLS
+    CALLS += 1
+    return _calc(jd, body, FLAGS | swe.FLG_SPEED)[QI + 3]
+
+
+def init_worker():
+    if EPHE_PATH:
+        swe.set_ephe_path(EPHE_PATH)
+    if EPHEMERIS == "jpl":
+        swe.set_jpl_file(JPL_FILE)
+    if TOPOCENTRIC:
+        swe.set_topo(TOPO_LON, TOPO_LAT, TOPO_ALT)
+
+
+# ------------------------------------------------------------- fitting
+def fit(body, a, b):
+    """Adaptive Chebyshev fit. A window is accepted only if the tail is small AND the
+    polynomial reproduces swisseph at held-out points (anti-aliasing validation)."""
+    half, mid = 0.5 * (b - a), 0.5 * (a + b)
+    v = np.array([val(mid + half * x, body) for x in NODES])
+    c = FIT_M @ v
+    ok = max(abs(c[-1]), abs(c[-2])) <= TOL
+    if ok:
+        truth = np.array([val(mid + half * x, body) for x in VAL_X])
+        ok = np.max(np.abs(truth - C.chebval(VAL_X, c))) <= VAL_TOL
+    if ok:
+        return [(a, b, c)]
+    if (b - a) > MIN_WIN:
+        return fit(body, a, mid) + fit(body, mid, b)
+    WARN.append(f"fit not converged for body {body} on [{a:.4f},{b:.4f}] at MIN_WIN")
+    return [(a, b, c)]
+
+
+# ------------------------------------------------- polynomial utilities
+def _bisect_poly(p, xa, xb):
+    neg_a = C.chebval(xa, p) < 0
+    for _ in range(80):
+        xm = 0.5 * (xa + xb)
+        if (C.chebval(xm, p) < 0) == neg_a:
+            xa = xm
+        else:
+            xb = xm
+    return 0.5 * (xa + xb)
+
+
+def stationary_x(d):
+    """All candidate stationary points of the fitted curve (roots of derivative d),
+    from TWO independent methods: eigenvalue roots AND a dense sign-change scan.
+    Extra candidates are harmless (each one is verified before use)."""
+    cand = []
+    if len(d) > 1:
+        r = C.chebroots(d)
+        r = r[np.abs(r.imag) < 1e-6].real
+        cand = [float(x) for x in r if -1.0 - EXT <= x <= 1.0 + EXT]
+    g = C.chebval(SCAN_X, d)
+    neg = g < 0
+    for i in np.nonzero(neg[:-1] != neg[1:])[0]:
+        xa, xb = SCAN_X[i], SCAN_X[i + 1]
+        if not any(xa - 1e-9 <= x <= xb + 1e-9 for x in cand):
+            cand.append(_bisect_poly(d, xa, xb))
+    out = []
+    for x in sorted(cand):
+        if not out or x - out[-1] > 1e-9:
+            out.append(x)
+    return out
+
+
+def _solve_piece(c, d, xa, xb, L, ga, gb):
+    """Root of c(x)=L inside a piece [xa,xb] whose end values already straddle L
+    (ga = c(xa)-L, gb = c(xb)-L). Safeguarded Newton + bisection."""
+    lo, hi, glo = xa, xb, ga
+    up_lo = glo >= 0
+    x = lo - glo * (hi - lo) / (gb - glo)
+    for _ in range(80):
+        g = float(C.chebval(x, c)) - L
+        if g == 0.0:
+            return x
+        if (g >= 0) == up_lo:
+            lo, glo = x, g
+        else:
+            hi = x
+        dg = float(C.chebval(x, d))
+        xn = x - g / dg if dg != 0.0 else float("nan")
+        if not (lo < xn < hi):
+            xn = 0.5 * (lo + hi)
+        if abs(xn - x) < 1e-14:
+            return xn
+        x = xn
+    return x
+
+
+# ----------------------------------------------------- root polishing
+def _bisect_true(f, lo, hi, f_lo):
+    """Bisection on a REAL function whose sign differs at lo and hi."""
+    pos_lo = f_lo >= 0
+    while hi - lo > ROOT_TOL:
+        m = 0.5 * (lo + hi)
+        if (f(m) >= 0) == pos_lo:
+            lo = m
+        else:
+            hi = m
+    return 0.5 * (lo + hi)
+
+
+def _polish_zero(vf, jd_fit, slope, t0, t1, v0):
+    """Re-solve value(jd) == 0 against the REAL ephemeris. [t0, t1] is a true bracket
+    (true values straddle 0 and the piece is monotonic). Newton with the accurate
+    polynomial slope; if Newton is unhappy or leaves the bracket, bisect it."""
+    jd = jd_fit
+    if slope != 0.0 and t0 < jd_fit < t1:
+        for _ in range(6):
+            step = vf(jd) / slope
+            jd -= step
+            if abs(step) < ROOT_TOL:
+                if t0 < jd < t1 and abs(jd - jd_fit) < POLISH_MAX_SHIFT:
+                    return jd
+                break
+    return _bisect_true(vf, t0, t1, v0)
+
+
+def _polish_station(sf, jd_fit, is_max):
+    """Bisection on the true swisseph speed. MAX: speed + -> -. MIN: - -> +."""
+    for h in (0.05, 0.2, 0.8):
+        sl, sr = sf(jd_fit - h), sf(jd_fit + h)
+        if (sl > 0 > sr) if is_max else (sl < 0 < sr):
+            return _bisect_true(sf, jd_fit - h, jd_fit + h, sl)
+    WARN.append(f"MAX/MIN polish bracket failed near JD {jd_fit:.5f}; kept fit root")
+    return jd_fit
+
+
+# ------------------------------------------------------------- solver
+def window_events(c, a, b, vf, sf):
+    """Every MAX/MIN and every zero crossing of one fitted window, polished against
+    the real ephemeris -> ([(jd, 'MAX'|'MIN', value)], [(jd, +1|-1)])."""
+    half, mid = 0.5 * (b - a), 0.5 * (a + b)
+    d = C.chebder(c)
+    ext = []
+    for x in stationary_x(d):
+        dl = float(C.chebval(x - 1e-6, d))
+        dr = float(C.chebval(x + 1e-6, d))
+        if (dl > 0) == (dr > 0):
+            continue                                         # touched zero, no sign change
+        is_max = dl > 0
+        jd = mid + half * x
+        if POLISH:
+            jd = _polish_station(sf, jd, is_max)
+            v = vf(jd)
+        else:
+            v = float(C.chebval(x, c))
+        ext.append((jd, "MAX" if is_max else "MIN", v))
+
+    # monotonic pieces: window edges + verified MAX/MIN. The straddle test uses TRUE
+    # values, so a MAX/MIN that grazes 0 cannot hide (or invent) a crossing.
+    ta, tb = mid - half * (1.0 + EXT), mid + half * (1.0 + EXT)
+    if POLISH:
+        va, vb = vf(ta), vf(tb)
+    else:
+        va, vb = float(C.chebval(-1.0 - EXT, c)), float(C.chebval(1.0 + EXT, c))
+    pts = [(ta, va)] + sorted((t, v) for t, _, v in ext if ta < t < tb) + [(tb, vb)]
+    zeros = []
+    for (t0, v0), (t1, v1) in zip(pts[:-1], pts[1:]):
+        if (v0 >= 0) == (v1 >= 0):
+            continue
+        direction = 1 if v1 >= 0 else -1
+        x0, x1 = (t0 - mid) / half, (t1 - mid) / half
+        p0, p1 = float(C.chebval(x0, c)), float(C.chebval(x1, c))
+        if (p0 >= 0) != (p1 >= 0):
+            x = _solve_piece(c, d, x0, x1, 0.0, p0, p1)
+            jd = mid + half * x
+            if POLISH:
+                jd = _polish_zero(vf, jd, float(C.chebval(x, d)) / half, t0, t1, v0)
+        else:                                                # fit disagrees with truth: grazing case
+            jd = _bisect_true(vf, t0, t1, v0)
+        zeros.append((jd, direction))
+    return ext, zeros
+
+
+# --------------------------------------------------------------- jobs
+def job(args):
+    """One fitted body over one time chunk (runs in a worker process)."""
+    global CALLS, WARN
+    CALLS = 0
+    WARN = []
+    init_worker()
+    nm, c0, c1 = args
+    body, W = ID[nm], _win[nm]
+    vf = lambda jd: val(jd, body)
+    sf = lambda jd: spd(jd, body)
+    ext, zeros = [], []
+    for i in range(int(np.ceil((c1 - c0) / W))):
+        a, b = c0 + i * W, min(c0 + (i + 1) * W, c1)
+        if b - a <= 1e-9:
+            continue
+        for wa, wb, c in fit(body, a, b):
+            e, z = window_events(c, wa, wb, vf, sf)
+            ext += e
+            zeros += z
+    ev = {}
+    for who in (["Rahu", "Ketu"] if nm == "Rahu" else [nm]):
+        if who not in ACTIVE:
+            continue
+        if SIGN.get(who, 1.0) < 0:                           # Ketu: same instants, mirrored
+            ev[who + ":x"] = [(t, FLIP[k], -v) for t, k, v in ext]
+            ev[who + ":z"] = [(t, -d) for t, d in zeros]
+        else:
+            ev[who + ":x"] = ext
+            ev[who + ":z"] = zeros
+    return ev, CALLS, WARN
+
+
+def _dedupe(rows):
+    """Merge seam duplicates: same kind/direction as the previous kept event and
+    closer than DEDUPE_DAYS. Rows are (jd, kind, ...)."""
+    out = []
+    for r in sorted(rows, key=lambda r: r[0]):
+        if out and out[-1][1] == r[1] and r[0] - out[-1][0] < DEDUPE_DAYS:
+            continue
+        out.append(r)
+    return out
+
+
+def build(start, end):
+    edges = list(np.arange(start, end, CHUNK)) + [end]
+    tasks = [(nm, float(c0), float(c1)) for c0, c1 in zip(edges[:-1], edges[1:]) for nm in FIT_BODIES]
+    if WORKERS > 1:
+        with ProcessPoolExecutor(WORKERS) as ex:
+            res = list(ex.map(job, tasks))
+    else:
+        res = [job(t) for t in tasks]
+    db, calls, warns = {}, 0, []
+    for ev, n, w in res:
+        calls += n
+        warns += w
+        for k, rows in ev.items():
+            db.setdefault(k, []).extend(rows)
+    for k in db:
+        db[k] = _dedupe(db[k])
+    return db, calls, warns
+
+
+# ------------------------------------------------- verification layers
+def timeline(db, k):
+    """All events of one body in time order: (jd, 'X', kind, value) / (jd, 'Z', dir, None)."""
+    ev = [(t, "X", kind, v) for t, kind, v in db.get(k + ":x", [])]
+    ev += [(t, "Z", d, None) for t, d in db.get(k + ":z", [])]
+    ev.sort(key=lambda e: e[0])
+    return ev
+
+
+def _sgn(v):
+    return None if v == 0.0 else (1 if v > 0 else -1)
+
+
+def step(state, e, k):
+    """Apply one event to the state (side of 0, direction of motion); None = unknown.
+    Raises AssertionError if the event cannot follow the current state."""
+    side, move = state
+    t, tag, a, v = e
+    if tag == "Z":
+        assert side is None or side == -a, (
+            f"{k}: {EV['ZERO']} {ZERO_TEXT[a]} at JD {t:.5f}, but the body is already on "
+            f"that side: a crossing was skipped or duplicated")
+        assert move is None or move == a, (
+            f"{k}: {EV['ZERO']} {ZERO_TEXT[a]} at JD {t:.5f} runs against the direction "
+            f"of motion: a MAX/MIN was skipped")
+        return a, a
+    rising = 1 if a == "MAX" else -1                         # motion just before the extremum
+    assert move is None or move == rising, (
+        f"{k}: {EV[a]} at JD {t:.5f} follows another {EV[a]}: a {EV[FLIP[a]]} was skipped")
+    s = _sgn(v)
+    assert side is None or s is None or side == s, (
+        f"{k}: {EV[a]} at JD {t:.5f} is {fmt_value(v)}, but the crossings put the body "
+        f"on the other side of 0: a crossing was skipped")
+    return (s if s is not None else side), -rising
+
+
+def check(db):
+    """Layer 5: replay every event through the state machine; adjacent MAX/MIN
+    values must be ordered (MAX above its neighbouring MINs)."""
+    for k in ACTIVE:
+        state, last_x = (None, None), None
+        for e in timeline(db, k):
+            state = step(state, e, k)
+            if e[1] == "X":
+                if last_x is not None:
+                    hi_, lo_ = (e, last_x) if e[2] == "MAX" else (last_x, e)
+                    assert hi_[3] > lo_[3], (f"{k}: MAX at JD {hi_[0]:.5f} is not above the "
+                                             f"MIN at JD {lo_[0]:.5f}")
+                last_x = e
+
+
+def audit(db, lo, hi):
+    """Layer 6: independent proof against the real ephemeris. Read the true side of 0
+    and the true direction of motion every AUDIT_STEP days; replaying the events
+    between two samples must start from the first and land on the second."""
+    if AUDIT_STEP <= 0:
+        return 0
+    global CALLS
+    before = CALLS
+    for k in ACTIVE:
+        body, s = ID[k], SIGN.get(k, 1.0)
+        ev = timeline(db, k)
+        jds = [e[0] for e in ev]
+        prev_t = prev_state = None
+        for t in np.arange(lo, hi, AUDIT_STEP):
+            t = float(t)
+            i = bisect.bisect_left(jds, t - AUDIT_MARGIN)
+            while i < len(jds) and jds[i] < t + AUDIT_MARGIN:   # step off event times
+                t = jds[i] + AUDIT_MARGIN
+                i += 1
+            truth = (_sgn(s * val(t, body)), _sgn(s * spd(t, body)))
+            if prev_t is not None:
+                state = prev_state
+                for e in ev[bisect.bisect_right(jds, prev_t):bisect.bisect_right(jds, t)]:
+                    state = step(state, e, k)
+                for what, got, want in zip(("side of 0", "direction"), state, truth):
+                    assert got is None or want is None or got == want, (
+                        f"audit {k}: replay gives {what} {got:+d} but the ephemeris gives "
+                        f"{want:+d} at JD {t:.5f} (window {prev_t:.5f}..{t:.5f}): event missed")
+            prev_t, prev_state = t, truth
+    return CALLS - before
+
+
+# ---------------------------------------------------------- tables
+def body_rows(db, name, lo, hi):
+    rows = []
+    for jd, kind, v in db.get(name + ":x", []):
+        if not lo <= jd < hi:
+            continue
+        if (kind == "MAX" and not SHOW_MAX_DECLINATION) or (kind == "MIN" and not SHOW_MIN_DECLINATION):
+            continue
+        rows.append((jd, name, EV[kind], fmt_value(v) if SHOW_VALUE else ""))
+    for jd, d in db.get(name + ":z", []):
+        if not lo <= jd < hi or not SHOW_DECLINATION_ZERO:
+            continue
+        if (ZERO_DIRECTION == "north" and d < 0) or (ZERO_DIRECTION == "south" and d > 0):
+            continue
+        rows.append((jd, name, EV["ZERO"], ZERO_TEXT[d]))
+    return rows
+
+
+def _all_rows(db, lo, hi):
+    rows = []
+    for name in ACTIVE:
+        rows += sorted(body_rows(db, name, lo, hi))
+    if SORT_BY == "time":
+        rows.sort()
+    return rows
+
+
+def show(db, lo, hi):
+    rows = _all_rows(db, lo, hi)
+    w = 18 + JD_DECIMALS - 8
+    head = f"{'body':<9}{'event':<18}{'detail':<22}"
+    head += f"{'JD':>{w}}" if SHOW_JD else ""
+    head += f"  {TZ_LABEL:<19}" if SHOW_IST else ""
+    print(head)
+    for jd, name, ev, detail in rows:
+        line = f"{name:<9}{ev:<18}{detail:<22}"
+        line += f"{jd:>{w}.{JD_DECIMALS}f}" if SHOW_JD else ""
+        line += f"  {jd_to_local(jd):<19}" if SHOW_IST else ""
+        print(line)
+
+
+def save_csv(db, lo, hi, filename):
+    rows = _all_rows(db, lo, hi)
+    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+        wr = csv.writer(f)
+        wr.writerow(["body", "event", "detail", "JD", TZ_LABEL])
+        for jd, name, ev, detail in rows:
+            wr.writerow([name, ev, detail, f"{jd:.{JD_DECIMALS}f}", jd_to_local(jd)])
+
+
+# --------------------------------------------------------------- main
+if __name__ == "__main__":
+    if not ACTIVE:
+        raise SystemExit("No body switched on in BODY_ON.")
+    s_jd = START_JD if START_JD is not None else swe.julday(*START_DATE)
+    if START_JD is None and START_DATE_IS_LOCAL:
+        s_jd -= TZ_OFFSET_HOURS / 24.0
+    lo, hi = s_jd, s_jd + DAYS
+    init_worker()
+
+    # ---- ephemeris pre-flight: every active body, every ~10 years, both ends
+    probe = list(np.arange(lo - PAD, hi + PAD, 3652.5)) + [hi + PAD]
+    for nm in FIT_BODIES:
+        for t in probe:
+            val(float(t), ID[nm])                  # raises if the file is missing/out of range
+    print(f"Ephemeris: {EPH_NAME[EPH_FLAG]}"
+          + (f"  (path: {EPHE_PATH})" if EPHE_PATH else "")
+          + ("  [fallback guard ON]" if REQUIRE_EPHEMERIS else "  [fallback guard OFF]"))
+
+    t0 = time.perf_counter()
+    db, calls, warns = build(lo - PAD, hi + PAD)
+    elapsed = time.perf_counter() - t0
+
+    if warns:
+        msg = f"{len(warns)} warning(s); first: {warns[0]}"
+        if STRICT:
+            raise RuntimeError(msg)
+        print("WARNING:", msg)
+
+    if RUN_CHECK:
+        check(db)
+        audit_calls = audit(db, lo, hi)
+        print(f"Verification passed: continuity check + ephemeris audit "
+              f"({audit_calls:,} audit calls)")
+
+    if PRINT_TABLE:
+        show(db, lo, hi)
+    if CSV_FILE:
+        save_csv(db, lo, hi, CSV_FILE)
+    if PRINT_TIME:
+        print(f"Execution time : {elapsed:.3f} s (excl. audit)")
+    if PRINT_CALLS:
+        print(f"Ephemeris calls: {calls:,}")
+
+    swe.close()
